@@ -1,49 +1,49 @@
 import os
 import re
 import logging
-import discord
+import unicodedata
+from collections import Counter
 
+import discord
 from discord.ext import commands
 from groq import AsyncGroq
 
+=====================================================
 
-# =====================================================
-# CONFIG
-# =====================================================
+CẤU HÌNH
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+=====================================================
+
+DISCORD_TOKEN = os.getenv(“DISCORD_TOKEN”)
+GROQ_API_KEY = os.getenv(“GROQ_API_KEY”)
 
 BOT_A_ID = 1248205177589334026
 CHANNEL_ID = 1564912638272602142
 
-MODEL = "openai/gpt-oss-120b"
-
-
-# =====================================================
-# CHECK CONFIG
-# =====================================================
+MODEL = “openai/gpt-oss-120b”
 
 if not DISCORD_TOKEN:
-    raise ValueError("Thiếu DISCORD_TOKEN!")
+raise ValueError(“Thiếu DISCORD_TOKEN!”)
 
 if not GROQ_API_KEY:
-    raise ValueError("Thiếu GROQ_API_KEY!")
+raise ValueError(“Thiếu GROQ_API_KEY!”)
 
+=====================================================
 
-# =====================================================
-# LOGGING
-# =====================================================
+LOGGING
+
+=====================================================
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+level=logging.INFO,
+format=”%(asctime)s | %(levelname)s | %(message)s”
 )
 
+=====================================================
 
-# =====================================================
-# DISCORD BOT
-# =====================================================
+KHỞI TẠO
+
+=====================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -51,268 +51,315 @@ intents.guilds = True
 intents.messages = True
 
 bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
+command_prefix=”!”,
+intents=intents
 )
-
-
-# =====================================================
-# GROQ AI
-# =====================================================
 
 ai = AsyncGroq(
-    api_key=GROQ_API_KEY,
-    max_retries=3,
-    timeout=45
+api_key=GROQ_API_KEY,
+max_retries=3,
+timeout=45
 )
-
-
-# =====================================================
-# MESSAGE TRACKING
-# =====================================================
 
 processed = set()
 processing = set()
 
+=====================================================
 
-# =====================================================
-# EXTRACT EMBED
-# =====================================================
+ĐỌC EMBED
+
+=====================================================
 
 def extract_embed(message):
+contents = []
 
-    contents = []
+for embed in message.embeds:
+    if embed.title:
+        contents.append(embed.title)
+    if embed.description:
+        contents.append(embed.description)
+    if embed.author and embed.author.name:
+        contents.append(embed.author.name)
+    for field in embed.fields:
+        if field.name:
+            contents.append(field.name)
+        if field.value:
+            contents.append(field.value)
+    if embed.footer and embed.footer.text:
+        contents.append(embed.footer.text)
+return "\n".join(contents).strip()
 
-    for embed in message.embeds:
+=====================================================
 
-        if embed.title:
-            contents.append(embed.title)
+TÁCH CHỮ CÁI
 
-        if embed.description:
-            contents.append(embed.description)
+=====================================================
 
-        if embed.author and embed.author.name:
-            contents.append(embed.author.name)
+def extract_scrambled_letters(question):
 
-        for field in embed.fields:
+match = re.search(
+    r"Từ cần đoán:\s*\*\*(.*?)\*\*",
+    question,
+    flags=re.IGNORECASE | re.DOTALL
+)
+if not match:
+    match = re.search(
+        r"Từ cần đoán:\s*(.+?)(?:\s*\(gồm|\n|$)",
+        question,
+        flags=re.IGNORECASE
+    )
+if not match:
+    logging.warning("Không tìm thấy chữ cái.")
+    return None
+raw = match.group(1).strip()
+parts = [
+    unicodedata.normalize("NFC", item.strip()).casefold()
+    for item in raw.split("/")
+    if item.strip()
+]
+letters = []
+for part in parts:
+    if len(part) != 1 or not part.isalpha():
+        logging.warning(f"Ký tự không hợp lệ: {part}")
+        return None
+    letters.append(part)
+return letters if letters else None
 
-            if field.name:
-                contents.append(field.name)
+=====================================================
 
-            if field.value:
-                contents.append(field.value)
+CHUẨN HÓA ĐÁP ÁN
 
-        if embed.footer and embed.footer.text:
-            contents.append(embed.footer.text)
+=====================================================
 
-    return "\n".join(contents).strip()
+def normalize_answer(text):
 
+text = unicodedata.normalize(
+    "NFC",
+    text
+).casefold()
+return [
+    char for char in text
+    if char.isalpha()
+]
 
-# =====================================================
-# SOLVE QUESTION
-# =====================================================
+=====================================================
+
+KIỂM TRA CHỮ CÁI
+
+=====================================================
+
+def validate_answer(answer, original_letters):
+
+answer_letters = normalize_answer(answer)
+if not answer_letters:
+    return False
+original_counter = Counter(original_letters)
+answer_counter = Counter(answer_letters)
+valid = original_counter == answer_counter
+if not valid:
+    logging.warning("Đáp án không khớp chữ cái!")
+    logging.warning(f"Đề bài: {original_counter}")
+    logging.warning(f"Đáp án: {answer_counter}")
+return valid
+
+=====================================================
+
+GỌI GROQ
+
+=====================================================
+
+async def ask_groq(prompt):
+
+response = await ai.chat.completions.create(
+    model=MODEL,
+    messages=[
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ],
+    temperature=0.1,
+    max_completion_tokens=2048,
+    reasoning_effort="low"
+)
+choice = response.choices[0]
+answer = choice.message.content or ""
+if not answer.strip():
+    logging.warning(
+        f"AI trả về rỗng: {choice.finish_reason}"
+    )
+    return None
+answer = answer.strip().replace("`", "")
+answer = re.sub(
+    r"^(đáp án|answer)\s*[:：-]?\s*",
+    "",
+    answer,
+    flags=re.IGNORECASE
+)
+return answer.splitlines()[0].strip().strip("\"'“”‘’")
+
+=====================================================
+
+GIẢI CÂU ĐỐ
+
+=====================================================
 
 async def solve_question(question):
 
-    prompt = f"""
-Bạn là chuyên gia giải trò chơi ghép chữ tiếng Việt.
+original_letters = extract_scrambled_letters(question)
+if not original_letters:
+    logging.error("Không lấy được chữ cái.")
+    return None
+letters_text = " / ".join(original_letters)
+logging.info(f"Các chữ cần ghép: {letters_text}")
+prompt = f"""
 
-Nhiệm vụ:
-Ghép các chữ cái được cung cấp thành từ hoặc cụm từ tiếng Việt có nghĩa.
+Bạn là chuyên gia giải trò chơi Vua Tiếng Việt.
 
-QUY TẮC:
-- Sử dụng đúng các chữ cái được cung cấp.
-- Không tự ý thêm chữ cái.
-- Không tự ý bỏ chữ cái.
-- Giữ đúng dấu tiếng Việt.
-- Chú ý số lượng ký tự.
-- Ưu tiên đáp án phù hợp với ngữ cảnh.
-- Nếu có nhiều khả năng, chọn đáp án hợp lý nhất.
-- Chỉ trả về đáp án.
-- Không giải thích.
-- Không viết lời dẫn.
+Hãy ghép các chữ cái sau thành từ hoặc cụm từ tiếng Việt có nghĩa.
+
+CÁC CHỮ CÁI:
+{letters_text}
 
 CÂU ĐỐ:
 {question}
-"""
 
-    try:
+YÊU CẦU:
 
-        logging.info("Đang gửi câu hỏi đến Groq...")
+* Sử dụng toàn bộ chữ cái.
+* Mỗi chữ cái chỉ sử dụng đúng số lần xuất hiện.
+* Không thêm chữ cái.
+* Không bỏ chữ cái.
+* Giữ nguyên dấu tiếng Việt.
+* Có thể ghép thành nhiều tiếng.
+* Ưu tiên từ có nghĩa và phù hợp ngữ cảnh.
+* Chỉ trả về đáp án.
+* Không giải thích.
+    “””
+    for attempt in range(3):
 
-        response = await ai.chat.completions.create(
-            model=MODEL,
+  try:
+      logging.info(
+          f"Đang giải lần {attempt + 1}/3..."
+      )
+      current_prompt = prompt
+      if attempt > 0:
+          current_prompt += """
 
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+Đáp án trước không vượt qua kiểm tra chữ cái.
+Hãy suy nghĩ lại từ đầu.
+Kiểm tra kỹ từng chữ cái và dấu tiếng Việt.
+Không được lặp lại đáp án sai.
+“””
 
-            temperature=0.1,
-            max_completion_tokens=2048,
-            reasoning_effort="low"
-        )
-
-        choice = response.choices[0]
-
-        answer = choice.message.content or ""
-
-        if not answer.strip():
-
-            logging.error(
-                f"AI trả về rỗng. "
-                f"Finish reason: {choice.finish_reason}"
-            )
-
-            return None
-
-        answer = answer.strip()
-        answer = answer.replace("`", "")
-
-        answer = re.sub(
-            r"^(đáp án|answer)\s*[:：-]?\s*",
-            "",
-            answer,
-            flags=re.IGNORECASE
-        )
-
-        answer = answer.splitlines()[0].strip()
-        answer = answer.strip("\"'“”‘’")
-
+        answer = await ask_groq(current_prompt)
         if not answer:
-            return None
-
-        logging.info(f"Đáp án AI: {answer}")
-
-        return answer
-
+            continue
+        logging.info(f"AI đề xuất: {answer}")
+        if validate_answer(answer, original_letters):
+            logging.info("ĐÁP ÁN HỢP LỆ!")
+            return answer
+        logging.warning("Đáp án sai, thử lại...")
     except Exception:
-
         logging.exception("Lỗi Groq API!")
+logging.error("Không tìm được đáp án hợp lệ.")
+return None
 
-        return None
+=====================================================
 
+XỬ LÝ TIN NHẮN
 
-# =====================================================
-# PROCESS MESSAGE
-# =====================================================
+=====================================================
 
 async def process_message(message):
 
-    message_id = message.id
-
-    if message_id in processed:
-        return
-
-    if message_id in processing:
-        return
-
-    # Chỉ nhận Bot A
-    if message.author.id != BOT_A_ID:
-        return
-
-    # Chỉ nhận kênh chỉ định
-    if message.channel.id != CHANNEL_ID:
-        return
-
-    # Chỉ nhận Embed
-    if not message.embeds:
-        return
-
-    question = extract_embed(message)
-
-    if not question:
-        logging.warning("Embed không có nội dung.")
-        return
-
-    processing.add(message_id)
-
-    try:
-
-        logging.info("=" * 45)
-        logging.info("NHẬN ĐƯỢC CÂU ĐỐ:")
-        logging.info(question)
-
-        answer = await solve_question(question)
-
-        if not answer:
-            logging.warning("Không tìm được đáp án.")
-            return
-
-        await message.reply(
-            content=f"`{answer}`",
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none()
+message_id = message.id
+if message_id in processed:
+    return
+if message_id in processing:
+    return
+if message.author.id != BOT_A_ID:
+    return
+if message.channel.id != CHANNEL_ID:
+    return
+if not message.embeds:
+    return
+question = extract_embed(message)
+if not question:
+    return
+processing.add(message_id)
+try:
+    logging.info("=" * 45)
+    logging.info("NHẬN ĐƯỢC CÂU ĐỐ:")
+    logging.info(question)
+    answer = await solve_question(question)
+    if not answer:
+        logging.warning(
+            "Không có đáp án hợp lệ. Không gửi."
         )
+        return
+    await message.reply(
+        content=f"`{answer}`",
+        mention_author=False,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+    logging.info(f"ĐÃ GỬI ĐÁP ÁN: {answer}")
+    processed.add(message_id)
+except discord.Forbidden:
+    logging.error("Bot thiếu quyền gửi tin nhắn!")
+except discord.HTTPException as e:
+    logging.error(f"Lỗi Discord: {e}")
+except Exception:
+    logging.exception("Lỗi xử lý tin nhắn!")
+finally:
+    processing.discard(message_id)
 
-        logging.info(f"ĐÃ TRẢ LỜI: {answer}")
+=====================================================
 
-        processed.add(message_id)
+TIN NHẮN MỚI
 
-    except discord.Forbidden:
-
-        logging.error(
-            "Bot thiếu quyền đọc hoặc gửi tin nhắn!"
-        )
-
-    except discord.HTTPException as e:
-
-        logging.error(f"Lỗi Discord HTTP: {e}")
-
-    except Exception:
-
-        logging.exception("Lỗi xử lý tin nhắn!")
-
-    finally:
-
-        processing.discard(message_id)
-
-
-# =====================================================
-# NEW MESSAGE
-# =====================================================
+=====================================================
 
 @bot.event
 async def on_message(message):
 
-    await process_message(message)
+await process_message(message)
+await bot.process_commands(message)
 
-    await bot.process_commands(message)
+=====================================================
 
+EMBED ĐƯỢC CHỈNH SỬA
 
-# =====================================================
-# EDIT MESSAGE
-# =====================================================
+=====================================================
 
 @bot.event
 async def on_message_edit(before, after):
 
-    if before.embeds != after.embeds:
+if before.embeds != after.embeds:
+    processed.discard(after.id)
+    await process_message(after)
 
-        processed.discard(after.id)
+=====================================================
 
-        await process_message(after)
+BOT ONLINE
 
-
-# =====================================================
-# BOT READY
-# =====================================================
+=====================================================
 
 @bot.event
 async def on_ready():
 
-    logging.info("=" * 45)
-    logging.info(f"BOT ONLINE: {bot.user}")
-    logging.info(f"BOT A ID: {BOT_A_ID}")
-    logging.info(f"CHANNEL ID: {CHANNEL_ID}")
-    logging.info(f"AI MODEL: {MODEL}")
-    logging.info("=" * 45)
+logging.info("=" * 45)
+logging.info(f"BOT ONLINE: {bot.user}")
+logging.info(f"BOT A ID: {BOT_A_ID}")
+logging.info(f"CHANNEL ID: {CHANNEL_ID}")
+logging.info(f"AI MODEL: {MODEL}")
+logging.info("KIỂM TRA CHỮ CÁI: ENABLED")
+logging.info("=" * 45)
 
+=====================================================
 
-# =====================================================
-# START BOT
-# =====================================================
+START BOT
+
+=====================================================
 
 bot.run(DISCORD_TOKEN)
