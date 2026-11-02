@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import unicodedata
-from collections import Counter
+from collections import Counter, OrderedDict
 
 import discord
 from discord.ext import commands
@@ -15,10 +15,16 @@ from groq import AsyncGroq
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Tùy chọn: đường dẫn file từ điển tiếng Việt (mỗi dòng một từ/cụm từ)
+WORDLIST_PATH = os.getenv("WORDLIST_PATH")
+
 BOT_A_ID = 1248205177589334026
 CHANNEL_ID = 1564912638272602142
 
 MODEL = "openai/gpt-oss-120b"
+MAX_ATTEMPTS = 3
+TEMPERATURES = [0.1, 0.5, 0.8]
+CACHE_SIZE = 1000
 
 if not DISCORD_TOKEN:
     raise ValueError("Missing DISCORD_TOKEN")
@@ -42,7 +48,7 @@ logging.basicConfig(
 # ==================================================
 
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # Bật Message Content Intent trong Developer Portal
 intents.guilds = True
 intents.messages = True
 
@@ -58,12 +64,67 @@ bot = commands.Bot(
 
 ai = AsyncGroq(
     api_key=GROQ_API_KEY,
-    max_retries=3,
+    max_retries=1,
     timeout=45
 )
 
-processed = set()
-processing = set()
+
+# ==================================================
+# BỘ NHỚ GIỚI HẠN (tránh tăng mãi)
+# ==================================================
+
+class BoundedDict:
+    def __init__(self, maxlen):
+        self.maxlen = maxlen
+        self._data = OrderedDict()
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value=True):
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxlen:
+            self._data.popitem(last=False)
+
+
+processed = BoundedDict(CACHE_SIZE)   # message_id đã trả lời xong
+attempted = BoundedDict(CACHE_SIZE)   # message_id -> nội dung câu đố đã thử
+processing = set()                    # message_id đang xử lý
+
+
+# ==================================================
+# TỪ ĐIỂN (TÙY CHỌN)
+# ==================================================
+
+def normalize_text(text):
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def load_wordlist(path):
+    if not path:
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as file:
+            words = {
+                normalize_text(line)
+                for line in file
+                if line.strip()
+            }
+
+        logging.info(f"Loaded {len(words)} words from {path}")
+        return words or None
+
+    except OSError:
+        logging.exception("Cannot load wordlist.")
+        return None
+
+
+WORDLIST = load_wordlist(WORDLIST_PATH)
 
 
 # ==================================================
@@ -159,11 +220,18 @@ def validate_answer(answer, original_letters):
     return Counter(answer_letters) == Counter(original_letters)
 
 
+def in_wordlist(answer):
+    if WORDLIST is None:
+        return True
+
+    return normalize_text(answer) in WORDLIST
+
+
 # ==================================================
 # GỌI GROQ
 # ==================================================
 
-async def ask_groq(prompt):
+async def ask_groq(prompt, temperature):
     response = await ai.chat.completions.create(
         model=MODEL,
         messages=[
@@ -172,7 +240,7 @@ async def ask_groq(prompt):
                 "content": prompt
             }
         ],
-        temperature=0.1,
+        temperature=temperature,
         max_completion_tokens=2048,
         reasoning_effort="low"
     )
@@ -195,7 +263,12 @@ async def ask_groq(prompt):
         flags=re.IGNORECASE
     )
 
-    return answer.splitlines()[0].strip().strip("\"'")
+    lines = answer.splitlines()
+
+    if not lines:
+        return None
+
+    return lines[0].strip().strip("\"'") or None
 
 
 # ==================================================
@@ -233,36 +306,58 @@ YÊU CẦU:
 - Không giải thích.
 """
 
-    for attempt in range(3):
+    rejected = []
+    fallback = None  # đúng chữ cái nhưng không có trong từ điển
+
+    for attempt in range(MAX_ATTEMPTS):
         try:
             logging.info(
-                f"Solving attempt {attempt + 1}/3"
+                f"Solving attempt {attempt + 1}/{MAX_ATTEMPTS}"
             )
 
             current_prompt = prompt
 
-            if attempt > 0:
-                current_prompt += """
-Đáp án trước không hợp lệ.
-Hãy suy nghĩ lại và tìm một đáp án khác.
-Kiểm tra chính xác từng chữ cái và dấu tiếng Việt.
-"""
+            if rejected:
+                current_prompt += (
+                    "\nCác đáp án SAI, tuyệt đối không lặp lại: "
+                    + ", ".join(rejected)
+                    + "\nKiểm tra chính xác từng chữ cái và dấu tiếng Việt.\n"
+                )
 
-            answer = await ask_groq(current_prompt)
+            temperature = TEMPERATURES[
+                min(attempt, len(TEMPERATURES) - 1)
+            ]
+
+            answer = await ask_groq(current_prompt, temperature)
 
             if not answer:
                 continue
 
             logging.info(f"AI answer: {answer}")
 
-            if validate_answer(answer, original_letters):
-                logging.info("Answer passed validation.")
-                return answer
+            if not validate_answer(answer, original_letters):
+                logging.warning("Answer rejected: wrong letters.")
+                rejected.append(answer)
+                continue
 
-            logging.warning("Answer rejected.")
+            if not in_wordlist(answer):
+                logging.warning("Answer not in wordlist.")
+                rejected.append(answer)
+
+                if fallback is None:
+                    fallback = answer
+
+                continue
+
+            logging.info("Answer passed validation.")
+            return answer
 
         except Exception:
             logging.exception("Groq API error.")
+
+    if fallback:
+        logging.info(f"Using fallback answer: {fallback}")
+        return fallback
 
     return None
 
@@ -294,6 +389,15 @@ async def process_message(message):
     if not question:
         return
 
+    # Bỏ qua embed không phải câu đố (kết quả, bảng điểm...)
+    if "từ cần đoán" not in question.casefold():
+        return
+
+    # Không thử lại nếu nội dung câu đố không đổi
+    if attempted.get(message_id) == question:
+        return
+
+    attempted.set(message_id, question)
     processing.add(message_id)
 
     try:
@@ -307,15 +411,13 @@ async def process_message(message):
             logging.warning("No valid answer found.")
             return
 
-        await message.reply(
-            content=f"`{answer}`",
-            mention_author=False,
+        await message.channel.send(
+            answer,
             allowed_mentions=discord.AllowedMentions.none()
         )
 
+        processed.set(message_id)
         logging.info(f"ANSWER SENT: {answer}")
-
-        processed.add(message_id)
 
     except discord.Forbidden:
         logging.error("Missing Discord permissions.")
@@ -341,10 +443,25 @@ async def on_message(message):
 
 
 @bot.event
-async def on_message_edit(before, after):
-    if before.embeds != after.embeds:
-        processed.discard(after.id)
-        await process_message(after)
+async def on_raw_message_edit(payload):
+    if payload.channel_id != CHANNEL_ID:
+        return
+
+    if payload.message_id in processed:
+        return
+
+    try:
+        channel = bot.get_channel(payload.channel_id)
+
+        if channel is None:
+            channel = await bot.fetch_channel(payload.channel_id)
+
+        message = await channel.fetch_message(payload.message_id)
+
+    except discord.HTTPException:
+        return
+
+    await process_message(message)
 
 
 @bot.event
@@ -355,6 +472,9 @@ async def on_ready():
     logging.info(f"CHANNEL ID: {CHANNEL_ID}")
     logging.info(f"MODEL: {MODEL}")
     logging.info("LETTER VALIDATION: ENABLED")
+    logging.info(
+        f"WORDLIST: {'ENABLED' if WORDLIST else 'DISABLED'}"
+    )
     logging.info("=" * 45)
 
 
