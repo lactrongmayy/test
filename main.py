@@ -1,10 +1,13 @@
 import os
 import re
+import time
+import asyncio
 import logging
 import unicodedata
-import aiohttp
 from collections import Counter, OrderedDict
+from typing import Optional, List, Dict, Tuple, Set
 
+import aiohttp
 import discord
 from discord.ext import commands
 from groq import AsyncGroq
@@ -16,24 +19,32 @@ from groq import AsyncGroq
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# File từ điển (tự tải về nếu chưa có)
-WORDLIST_PATH = os.getenv("WORDLIST_PATH", "Viet74K.txt")
-WORDLIST_URLS = [
-    "https://vietnamese-wordlist.duyet.net/Viet74K.txt",
-    "https://raw.githubusercontent.com/duyet/vietnamese-wordlist/master/Viet74K.txt",
-]
+WORDLIST_DIR = os.getenv("WORDLIST_DIR", "wordlists")
+WORDLIST_SOURCES: Dict[str, List[str]] = {
+    "Viet74K.txt": [
+        "https://vietnamese-wordlist.duyet.net/Viet74K.txt",
+        "https://raw.githubusercontent.com/duyet/vietnamese-wordlist/master/Viet74K.txt",
+    ],
+    "UTS_Dictionary.txt": [
+        "https://huggingface.co/datasets/undertheseanlp/UTS_Dictionary/resolve/main/data/data.txt",
+    ],
+}
+EXTRA_WORDS_FILE = os.path.join(WORDLIST_DIR, "extra_words.txt")
 
-BOT_A_ID = 1248205177589334026
-CHANNEL_ID = 1564912638272602142
+# Có thể override bằng env
+BOT_A_ID = int(os.getenv("BOT_A_ID", "1248205177589334026"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "1564912638272602142"))
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
-MODEL = "openai/gpt-oss-120b"
 MAX_ATTEMPTS = 3
-TEMPERATURES = [0.1, 0.5, 0.8]
-CACHE_SIZE = 1000
+TEMPERATURES = [0.1, 0.4, 0.7]
+CACHE_SIZE = 1500
+MAX_AI_TOKENS = 64          # đáp án rất ngắn
+SEND_RETRIES = 3
+AI_RETRIES = 2
 
 if not DISCORD_TOKEN:
     raise ValueError("Missing DISCORD_TOKEN")
-
 if not GROQ_API_KEY:
     raise ValueError("Missing GROQ_API_KEY")
 
@@ -44,50 +55,48 @@ if not GROQ_API_KEY:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
 )
+log = logging.getLogger("vua-tieng-viet")
 
 
 # ==================================================
-# DISCORD
+# DISCORD + GROQ
 # ==================================================
 
 intents = discord.Intents.default()
-intents.message_content = True  # Bật Message Content Intent trong Developer Portal
+intents.message_content = True
 intents.guilds = True
 intents.messages = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-
-# ==================================================
-# GROQ
-# ==================================================
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 ai = AsyncGroq(
     api_key=GROQ_API_KEY,
     max_retries=1,
-    timeout=45
+    timeout=40.0,
 )
 
 
 # ==================================================
-# BỘ NHỚ GIỚI HẠN (tránh tăng mãi)
+# BỘ NHỚ GIỚI HẠN
 # ==================================================
 
 class BoundedDict:
-    def __init__(self, maxlen):
+    """LRU-style dict với kích thước cố định."""
+    def __init__(self, maxlen: int):
         self.maxlen = maxlen
-        self._data = OrderedDict()
+        self._data: OrderedDict = OrderedDict()
 
-    def __contains__(self, key):
+    def __contains__(self, key) -> bool:
         return key in self._data
 
     def get(self, key, default=None):
-        return self._data.get(key, default)
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        return default
 
     def set(self, key, value=True):
         self._data[key] = value
@@ -95,21 +104,24 @@ class BoundedDict:
         while len(self._data) > self.maxlen:
             self._data.popitem(last=False)
 
+    def __len__(self) -> int:
+        return len(self._data)
 
-processed = BoundedDict(CACHE_SIZE)   # message_id đã trả lời xong
-attempted = BoundedDict(CACHE_SIZE)   # message_id -> nội dung câu đố đã thử
-processing = set()                    # message_id đang xử lý
+
+processed = BoundedDict(CACHE_SIZE)      # đã trả lời thành công
+attempted = BoundedDict(CACHE_SIZE)      # số lần đã thử
+processing_locks: Dict[int, asyncio.Lock] = {}  # tránh race
 
 
 # ==================================================
-# TỪ ĐIỂN + CHỈ MỤC ANAGRAM
+# TỪ ĐIỂN + CHỈ MỤC
 # ==================================================
 
-def normalize_text(text):
+def normalize_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFC", text).casefold().split())
 
 
-def letters_key(text):
+def letters_key(text: str) -> str:
     chars = [
         c for c in unicodedata.normalize("NFC", text).casefold()
         if c.isalpha()
@@ -117,228 +129,327 @@ def letters_key(text):
     return "".join(sorted(chars))
 
 
-ANAGRAMS = {}  # key chữ cái đã sắp xếp -> danh sách đáp án
+ANAGRAMS: Dict[str, List[str]] = {}
+SYLLABLES: Set[str] = set()
+BIGRAMS: Set[Tuple[str, str]] = set()
 
 
-def build_index(lines):
+def build_index(lines: List[str]) -> None:
     ANAGRAMS.clear()
-    seen = set()
+    SYLLABLES.clear()
+    BIGRAMS.clear()
+    seen: Set[str] = set()
 
     for line in lines:
         word = normalize_text(line)
-
         if not word or word in seen:
             continue
-
         if not all(c.isalpha() or c in " -" for c in word):
             continue
 
         seen.add(word)
-        ANAGRAMS.setdefault(letters_key(word), []).append(word)
+        key = letters_key(word)
+        ANAGRAMS.setdefault(key, []).append(word)
 
-    logging.info(f"Indexed {len(seen)} words.")
+        syllables = word.replace("-", " ").split()
+        SYLLABLES.update(syllables)
+
+        for left, right in zip(syllables, syllables[1:]):
+            BIGRAMS.add((left, right))
+
+    log.info(f"Indexed {len(seen)} entries | {len(SYLLABLES)} syllables | {len(BIGRAMS)} bigrams")
 
 
-async def load_wordlist():
-    if os.path.exists(WORDLIST_PATH):
-        with open(WORDLIST_PATH, encoding="utf-8") as file:
-            build_index(file.read().splitlines())
-        return
+async def download_list(session: aiohttp.ClientSession, name: str, urls: List[str]) -> List[str]:
+    path = os.path.join(WORDLIST_DIR, name)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    for url in urls:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status != 200:
+                    log.warning(f"{url} → HTTP {resp.status}")
+                    continue
+                text = await resp.text(encoding="utf-8")
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            log.info(f"Downloaded {name}")
+            return text.splitlines()
+        except Exception as e:
+            log.warning(f"Cannot download {url}: {e}")
+
+    log.warning(f"Skipped {name}")
+    return []
+
+
+async def load_wordlist() -> None:
+    os.makedirs(WORDLIST_DIR, exist_ok=True)
+    lines: List[str] = []
 
     async with aiohttp.ClientSession() as session:
-        for url in WORDLIST_URLS:
-            try:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status != 200:
-                        continue
+        tasks = [
+            download_list(session, name, urls)
+            for name, urls in WORDLIST_SOURCES.items()
+        ]
+        results = await asyncio.gather(*tasks)
+        for r in results:
+            lines.extend(r)
 
-                    text = await resp.text(encoding="utf-8")
+    if os.path.exists(EXTRA_WORDS_FILE):
+        with open(EXTRA_WORDS_FILE, encoding="utf-8") as f:
+            lines.extend(f.read().splitlines())
 
-                with open(WORDLIST_PATH, "w", encoding="utf-8") as file:
-                    file.write(text)
+    if not lines:
+        log.error("No wordlist available — falling back to AI only")
+        return
 
-                build_index(text.splitlines())
-                return
-
-            except Exception:
-                logging.exception(f"Cannot download {url}")
-
-    logging.error("Wordlist unavailable, using AI only.")
+    build_index(lines)
 
 
 # ==================================================
-# ĐỌC EMBED
+# TIỆN ÍCH CÂU ĐỐ
 # ==================================================
 
-def extract_embed(message):
-    contents = []
-
+def extract_embed(message: discord.Message) -> str:
+    parts: List[str] = []
     for embed in message.embeds:
         if embed.title:
-            contents.append(embed.title)
-
+            parts.append(embed.title)
         if embed.description:
-            contents.append(embed.description)
-
+            parts.append(embed.description)
         if embed.author and embed.author.name:
-            contents.append(embed.author.name)
-
+            parts.append(embed.author.name)
         for field in embed.fields:
             if field.name:
-                contents.append(field.name)
-
+                parts.append(field.name)
             if field.value:
-                contents.append(field.value)
-
+                parts.append(field.value)
         if embed.footer and embed.footer.text:
-            contents.append(embed.footer.text)
+            parts.append(embed.footer.text)
+    return "\n".join(parts).strip()
 
-    return "\n".join(contents).strip()
 
-
-# ==================================================
-# LẤY CHỮ CÁI
-# ==================================================
-
-def extract_scrambled_letters(question):
+def extract_scrambled_letters(question: str) -> Optional[List[str]]:
+    # Ưu tiên dạng **bold**
     match = re.search(
         r"Từ cần đoán:\s*\*\*(.*?)\*\*",
         question,
-        flags=re.IGNORECASE | re.DOTALL
+        flags=re.IGNORECASE | re.DOTALL,
     )
-
     if not match:
         match = re.search(
             r"Từ cần đoán:\s*(.+?)(?:\s*\(gồm|\n|$)",
             question,
-            flags=re.IGNORECASE
+            flags=re.IGNORECASE,
         )
-
     if not match:
-        logging.warning("Cannot find scrambled letters.")
+        log.warning("Cannot find scrambled letters")
         return None
 
     raw = match.group(1).strip()
-
     parts = [
-        unicodedata.normalize("NFC", item.strip()).casefold()
-        for item in raw.split("/")
-        if item.strip()
+        unicodedata.normalize("NFC", p.strip()).casefold()
+        for p in raw.split("/")
+        if p.strip()
     ]
-
     if not parts:
         return None
 
-    for part in parts:
-        if not part.isalpha():
-            logging.warning(f"Invalid character: {part}")
+    for p in parts:
+        if not p.isalpha():
+            log.warning(f"Invalid character in letters: {p}")
             return None
-
     return parts
 
 
-# ==================================================
-# KIỂM TRA ĐÁP ÁN
-# ==================================================
-
-def normalize_answer(text):
+def normalize_answer_letters(text: str) -> List[str]:
     text = unicodedata.normalize("NFC", text).casefold()
-
-    return [
-        char for char in text
-        if char.isalpha()
-    ]
+    return [c for c in text if c.isalpha()]
 
 
-def validate_answer(answer, original_letters):
-    answer_letters = normalize_answer(answer)
-
-    if not answer_letters:
-        return False
-
-    return Counter(answer_letters) == Counter(original_letters)
-
-
-# ==================================================
-# GỌI GROQ
-# ==================================================
-
-async def ask_groq(prompt, temperature):
-    response = await ai.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=temperature,
-        max_completion_tokens=2048,
-        reasoning_effort="low"
+def validate_answer(answer: str, original_letters: List[str]) -> bool:
+    return Counter(normalize_answer_letters(answer)) == Counter(
+        "".join(original_letters)
     )
 
-    choice = response.choices[0]
-    answer = choice.message.content or ""
 
-    if not answer.strip():
-        logging.warning(
-            f"Empty AI response: {choice.finish_reason}"
-        )
-        return None
+# ==================================================
+# GHÉP ÂM TIẾT (cải tiến)
+# ==================================================
 
-    answer = answer.strip().replace("`", "")
+def solve_by_syllables(
+    letters: List[str],
+    max_parts: int = 7,
+    max_results: int = 40,
+    top: int = 12,
+    timeout: float = 4.5,
+) -> List[str]:
+    """
+    Sinh các cụm từ có thứ tự ngay từ đầu, ưu tiên bigram.
+    Tránh permutation toàn bộ → nhanh hơn rõ rệt.
+    """
+    deadline = time.monotonic() + timeout
+    total = Counter("".join(letters))
+    target_len = sum(total.values())
 
-    answer = re.sub(
-        r"^(đáp án|answer)\s*[:：-]?\s*",
-        "",
-        answer,
-        flags=re.IGNORECASE
+    # Chỉ giữ âm tiết khả thi
+    fitting: List[Tuple[str, Counter]] = []
+    for syl in SYLLABLES:
+        cnt = Counter(syl)
+        if all(total[c] >= n for c, n in cnt.items()):
+            fitting.append((syl, cnt))
+
+    # Sắp xếp theo độ dài giảm dần để ưu tiên âm tiết dài hơn (giảm branching)
+    fitting.sort(key=lambda x: -len(x[0]))
+
+    results: Dict[str, Tuple[int, int]] = {}  # phrase -> (bigram_score, -num_parts)
+
+    def rec(chosen: List[str], remaining: Counter, used_len: int):
+        if time.monotonic() > deadline or len(results) >= max_results:
+            return
+
+        if used_len == target_len:
+            phrase = " ".join(chosen)
+            # điểm bigram
+            score = sum(
+                1 for a, b in zip(chosen, chosen[1:]) if (a, b) in BIGRAMS
+            )
+            results[phrase] = (score, -len(chosen))
+            return
+
+        if len(chosen) >= max_parts:
+            return
+
+        # Ưu tiên âm tiết bắt đầu bằng chữ cái còn lại ít nhất (pruning nhẹ)
+        for syl, cnt in fitting:
+            if not all(remaining[c] >= n for c, n in cnt.items()):
+                continue
+
+            # cập nhật remaining
+            for c, n in cnt.items():
+                remaining[c] -= n
+            chosen.append(syl)
+
+            rec(chosen, remaining, used_len + sum(cnt.values()))
+
+            chosen.pop()
+            for c, n in cnt.items():
+                remaining[c] += n
+
+            if time.monotonic() > deadline or len(results) >= max_results:
+                return
+
+    rec([], Counter(total), 0)
+
+    ranked = sorted(
+        results.items(),
+        key=lambda x: (x[1][0], x[1][1]),  # bigram cao → ít phần hơn
+        reverse=True,
     )
+    return [phrase for phrase, _ in ranked[:top]]
 
-    lines = answer.splitlines()
 
-    if not lines:
-        return None
+def segment_syllables(text: str, max_len: int = 7) -> Optional[List[str]]:
+    """Tách chuỗi viết liền thành âm tiết hợp lệ (DP)."""
+    text = text.replace(" ", "")
+    n = len(text)
+    best: List[Optional[List[str]]] = [None] * (n + 1)
+    best[0] = []
 
-    return lines[0].strip().strip("\"'") or None
+    for i in range(1, n + 1):
+        for j in range(max(0, i - max_len), i):
+            if best[j] is None:
+                continue
+            piece = text[j:i]
+            if piece in SYLLABLES:
+                candidate = best[j] + [piece]
+                if best[i] is None or len(candidate) < len(best[i]):
+                    best[i] = candidate
+    return best[n]
+
+
+def repair_answer(answer: str) -> Optional[str]:
+    if not SYLLABLES:
+        return answer
+
+    tokens = normalize_text(answer).split()
+    if tokens and all(t in SYLLABLES for t in tokens):
+        return " ".join(tokens)
+
+    pieces = segment_syllables("".join(tokens))
+    return " ".join(pieces) if pieces else None
 
 
 # ==================================================
-# GIẢI CÂU ĐỐ
+# GROQ
 # ==================================================
 
-async def pick_candidate(question, candidates):
-    prompt = f"""
-Câu đố:
+async def ask_groq(prompt: str, temperature: float) -> Optional[str]:
+    for attempt in range(AI_RETRIES + 1):
+        try:
+            response = await ai.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_completion_tokens=MAX_AI_TOKENS,
+                reasoning_effort="low",
+            )
+            choice = response.choices[0]
+            answer = (choice.message.content or "").strip()
+
+            if not answer:
+                log.warning(f"Empty AI response ({choice.finish_reason})")
+                return None
+
+            # Làm sạch
+            answer = answer.replace("`", "").strip()
+            answer = re.sub(
+                r"^(đáp án|answer|kết quả)\s*[:：\-]?\s*",
+                "",
+                answer,
+                flags=re.IGNORECASE,
+            )
+            lines = [ln.strip().strip("\"'") for ln in answer.splitlines() if ln.strip()]
+            return lines[0] if lines else None
+
+        except Exception as e:
+            log.warning(f"Groq error (attempt {attempt + 1}): {e}")
+            if attempt < AI_RETRIES:
+                await asyncio.sleep(0.8 * (attempt + 1))
+            else:
+                return None
+    return None
+
+
+async def pick_candidate(question: str, candidates: List[str]) -> str:
+    if len(candidates) == 1:
+        return candidates[0]
+
+    prompt = f"""Câu đố:
 {question}
 
 Các đáp án khả dĩ:
 {chr(10).join("- " + c for c in candidates)}
 
 Chọn đúng MỘT đáp án phù hợp ngữ cảnh nhất.
-Chỉ trả về đáp án đó, không giải thích.
-"""
-    try:
-        picked = await ask_groq(prompt, 0.1)
-    except Exception:
-        logging.exception("Groq API error (pick).")
-        return candidates[0]
-
-    if picked and normalize_text(picked) in candidates:
-        return normalize_text(picked)
-
+Chỉ trả về đáp án đó, không giải thích."""
+    picked = await ask_groq(prompt, 0.1)
+    if picked:
+        norm = normalize_text(picked)
+        for c in candidates:
+            if normalize_text(c) == norm:
+                return c
     return candidates[0]
 
 
-async def solve_with_ai(question, original_letters):
+async def solve_with_ai(question: str, original_letters: List[str]) -> Optional[str]:
     letters_text = " / ".join(original_letters)
+    base_prompt = f"""Bạn là chuyên gia giải trò chơi Vua Tiếng Việt.
 
-    prompt = f"""
-Bạn là chuyên gia giải trò chơi Vua Tiếng Việt.
-
-CÁC CHỮ CÁI:
+CÁC CHỮ CÁI (phải dùng hết, không thêm, không bớt):
 {letters_text}
 
 CÂU ĐỐ:
@@ -346,74 +457,78 @@ CÂU ĐỐ:
 
 YÊU CẦU:
 - Ghép thành từ hoặc cụm từ tiếng Việt có nghĩa.
-- Sử dụng toàn bộ chữ cái.
-- Không thêm chữ cái.
-- Không bỏ chữ cái.
-- Mỗi chữ cái chỉ được sử dụng đúng số lần.
-- Giữ đúng dấu tiếng Việt.
-- Ưu tiên đáp án phù hợp ngữ cảnh.
-- Chỉ trả về đáp án.
-- Không giải thích.
-"""
+- Sử dụng đúng toàn bộ chữ cái (kể cả dấu).
+- Các âm tiết viết cách nhau bằng dấu cách (ví dụ: lá lúa).
+- Chỉ trả về đáp án duy nhất.
+- Không giải thích."""
 
-    rejected = []
+    rejected: List[str] = []
+    lenient: Optional[str] = None
 
     for attempt in range(MAX_ATTEMPTS):
-        try:
-            logging.info(f"AI attempt {attempt + 1}/{MAX_ATTEMPTS}")
+        prompt = base_prompt
+        if rejected:
+            prompt += (
+                "\n\nCác đáp án SAI, tuyệt đối không lặp lại: "
+                + ", ".join(rejected)
+                + "\nKiểm tra chính xác từng chữ cái và dấu."
+            )
 
-            current_prompt = prompt
+        temp = TEMPERATURES[min(attempt, len(TEMPERATURES) - 1)]
+        log.info(f"AI attempt {attempt + 1}/{MAX_ATTEMPTS} (temp={temp})")
 
-            if rejected:
-                current_prompt += (
-                    "\nCác đáp án SAI, tuyệt đối không lặp lại: "
-                    + ", ".join(rejected)
-                    + "\nKiểm tra chính xác từng chữ cái và dấu tiếng Việt.\n"
-                )
+        answer = await ask_groq(prompt, temp)
+        if not answer:
+            continue
 
-            temperature = TEMPERATURES[
-                min(attempt, len(TEMPERATURES) - 1)
-            ]
+        log.info(f"AI raw: {answer}")
+        fixed = repair_answer(answer)
 
-            answer = await ask_groq(current_prompt, temperature)
-
-            if not answer:
-                continue
-
-            logging.info(f"AI answer: {answer}")
-
-            if validate_answer(answer, original_letters):
-                return answer
-
-            logging.warning("Answer rejected: wrong letters.")
+        if fixed is None:
+            log.warning("Rejected: invalid syllables")
             rejected.append(answer)
+            if lenient is None and validate_answer(answer, original_letters):
+                lenient = answer
+            continue
 
-        except Exception:
-            logging.exception("Groq API error.")
+        if validate_answer(fixed, original_letters):
+            return fixed
 
+        log.warning("Rejected: letter mismatch")
+        rejected.append(answer)
+
+    if lenient:
+        log.info(f"Using lenient answer: {lenient}")
+        return lenient
     return None
 
 
-async def solve_question(question):
+async def solve_question(question: str) -> Optional[str]:
     original_letters = extract_scrambled_letters(question)
-
     if not original_letters:
         return None
 
     letters_text = " / ".join(original_letters)
-    logging.info(f"Letters: {letters_text}")
+    log.info(f"Letters: {letters_text}")
 
-    # Bước 1: tra từ điển theo anagram (chính xác 100% về chữ cái)
-    candidates = ANAGRAMS.get(letters_key("".join(original_letters)), [])
-    logging.info(f"Dictionary candidates: {candidates}")
+    # 1. Anagram dictionary
+    key = letters_key("".join(original_letters))
+    candidates = ANAGRAMS.get(key, [])
+    log.info(f"Dictionary hits: {candidates}")
 
     if len(candidates) == 1:
         return candidates[0]
-
     if len(candidates) > 1:
         return await pick_candidate(question, candidates)
 
-    # Bước 2: không có trong từ điển -> nhờ AI
+    # 2. Ghép âm tiết
+    if SYLLABLES:
+        combos = await asyncio.to_thread(solve_by_syllables, original_letters)
+        log.info(f"Syllable candidates: {combos}")
+        if combos:
+            return await pick_candidate(question, combos)
+
+    # 3. AI
     return await solve_with_ai(question, original_letters)
 
 
@@ -421,99 +536,106 @@ async def solve_question(question):
 # XỬ LÝ TIN NHẮN
 # ==================================================
 
-async def process_message(message):
-    message_id = message.id
+async def safe_send(channel: discord.abc.Messageable, content: str) -> bool:
+    for attempt in range(SEND_RETRIES):
+        try:
+            await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
+        except discord.HTTPException as e:
+            if e.status == 429:  # rate limit
+                retry_after = getattr(e, "retry_after", 1.5)
+                log.warning(f"Rate limited, sleep {retry_after:.1f}s")
+                await asyncio.sleep(retry_after + 0.3)
+            else:
+                log.error(f"Discord HTTP {e.status}: {e}")
+                if attempt < SEND_RETRIES - 1:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+        except Exception as e:
+            log.error(f"Send error: {e}")
+            if attempt < SEND_RETRIES - 1:
+                await asyncio.sleep(0.8 * (attempt + 1))
+    return False
 
-    if message_id in processed:
+
+async def process_message(message: discord.Message) -> None:
+    mid = message.id
+
+    if mid in processed:
         return
-
-    if message_id in processing:
-        return
-
     if message.author.id != BOT_A_ID:
         return
-
     if message.channel.id != CHANNEL_ID:
         return
-
     if not message.embeds:
         return
 
     question = extract_embed(message)
-
-    if not question:
+    if not question or "từ cần đoán" not in question.casefold():
         return
 
-    # Bỏ qua embed không phải câu đố (kết quả, bảng điểm...)
-    if "từ cần đoán" not in question.casefold():
+    # Giới hạn số lần thử
+    tries = attempted.get(mid, 0)
+    if tries >= 2:
+        return
+    attempted.set(mid, tries + 1)
+
+    # Lock theo message_id
+    lock = processing_locks.setdefault(mid, asyncio.Lock())
+    if lock.locked():
         return
 
-    # Không thử lại nếu nội dung câu đố không đổi
-    if attempted.get(message_id) == question:
-        return
-
-    attempted.set(message_id, question)
-    processing.add(message_id)
-
-    try:
-        logging.info("=" * 45)
-        logging.info("NEW PUZZLE:")
-        logging.info(question)
-
-        answer = await solve_question(question)
-
-        if not answer:
-            logging.warning("No valid answer found.")
+    async with lock:
+        if mid in processed:  # double-check
             return
 
-        await message.channel.send(
-            answer,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
+        try:
+            log.info("=" * 50)
+            log.info("NEW PUZZLE")
+            log.info(question[:300] + ("..." if len(question) > 300 else ""))
 
-        processed.set(message_id)
-        logging.info(f"ANSWER SENT: {answer}")
+            answer = await solve_question(question)
+            if not answer:
+                log.warning("No valid answer found")
+                return
 
-    except discord.Forbidden:
-        logging.error("Missing Discord permissions.")
+            ok = await safe_send(message.channel, answer)
+            if ok:
+                processed.set(mid)
+                log.info(f"ANSWER SENT → {answer}")
+            else:
+                log.error("Failed to send answer after retries")
 
-    except discord.HTTPException as error:
-        logging.error(f"Discord error: {error}")
-
-    except Exception:
-        logging.exception("Message processing error.")
-
-    finally:
-        processing.discard(message_id)
+        except Exception:
+            log.exception("Unexpected error in process_message")
+        finally:
+            # dọn lock cũ
+            processing_locks.pop(mid, None)
 
 
 # ==================================================
-# EVENT
+# EVENTS
 # ==================================================
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     await process_message(message)
     await bot.process_commands(message)
 
 
 @bot.event
-async def on_raw_message_edit(payload):
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if payload.channel_id != CHANNEL_ID:
         return
-
     if payload.message_id in processed:
         return
 
     try:
-        channel = bot.get_channel(payload.channel_id)
-
-        if channel is None:
-            channel = await bot.fetch_channel(payload.channel_id)
-
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
-
-    except discord.HTTPException:
+    except (discord.HTTPException, discord.NotFound):
         return
 
     await process_message(message)
@@ -526,18 +648,18 @@ async def setup_hook():
 
 @bot.event
 async def on_ready():
-    logging.info("=" * 45)
-    logging.info(f"BOT ONLINE: {bot.user}")
-    logging.info(f"BOT A ID: {BOT_A_ID}")
-    logging.info(f"CHANNEL ID: {CHANNEL_ID}")
-    logging.info(f"MODEL: {MODEL}")
-    logging.info("LETTER VALIDATION: ENABLED")
-    logging.info(f"DICTIONARY ENTRIES: {len(ANAGRAMS)} anagram groups")
-    logging.info("=" * 45)
+    log.info("=" * 50)
+    log.info(f"BOT ONLINE  : {bot.user}")
+    log.info(f"Watching bot: {BOT_A_ID}")
+    log.info(f"Channel     : {CHANNEL_ID}")
+    log.info(f"Model       : {MODEL}")
+    log.info(f"Anagram groups: {len(ANAGRAMS)}")
+    log.info("=" * 50)
 
 
 # ==================================================
-# START BOT
+# START
 # ==================================================
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
