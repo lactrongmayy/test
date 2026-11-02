@@ -8,24 +8,20 @@ from groq import AsyncGroq
 
 
 # =====================================================
-# CẤU HÌNH
+# CONFIG
 # =====================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ID bot gửi câu đố
 BOT_A_ID = 1248205177589334026
-
-# ID kênh cần theo dõi
 CHANNEL_ID = 1564912638272602142
 
-# Model Groq
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "openai/gpt-oss-120b"
 
 
 # =====================================================
-# KIỂM TRA CẤU HÌNH
+# CHECK CONFIG
 # =====================================================
 
 if not DISCORD_TOKEN:
@@ -36,7 +32,7 @@ if not GROQ_API_KEY:
 
 
 # =====================================================
-# LOG
+# LOGGING
 # =====================================================
 
 logging.basicConfig(
@@ -46,7 +42,7 @@ logging.basicConfig(
 
 
 # =====================================================
-# KHỞI TẠO
+# DISCORD BOT
 # =====================================================
 
 intents = discord.Intents.default()
@@ -59,21 +55,28 @@ bot = commands.Bot(
     intents=intents
 )
 
+
+# =====================================================
+# GROQ AI
+# =====================================================
+
 ai = AsyncGroq(
     api_key=GROQ_API_KEY,
     max_retries=3,
-    timeout=30
+    timeout=45
 )
 
-# Lưu ID tin nhắn đã xử lý
-processed = set()
 
-# Lưu ID tin nhắn đang xử lý
+# =====================================================
+# MESSAGE TRACKING
+# =====================================================
+
+processed = set()
 processing = set()
 
 
 # =====================================================
-# ĐỌC NỘI DUNG EMBED
+# EXTRACT EMBED
 # =====================================================
 
 def extract_embed(message):
@@ -91,14 +94,13 @@ def extract_embed(message):
         if embed.author and embed.author.name:
             contents.append(embed.author.name)
 
-        if embed.fields:
-            for field in embed.fields:
+        for field in embed.fields:
 
-                if field.name:
-                    contents.append(field.name)
+            if field.name:
+                contents.append(field.name)
 
-                if field.value:
-                    contents.append(field.value)
+            if field.value:
+                contents.append(field.value)
 
         if embed.footer and embed.footer.text:
             contents.append(embed.footer.text)
@@ -107,7 +109,7 @@ def extract_embed(message):
 
 
 # =====================================================
-# GIẢI CÂU ĐỐ BẰNG GROQ
+# SOLVE QUESTION
 # =====================================================
 
 async def solve_question(question):
@@ -116,19 +118,19 @@ async def solve_question(question):
 Bạn là chuyên gia giải trò chơi ghép chữ tiếng Việt.
 
 Nhiệm vụ:
-Đọc câu đố và ghép các chữ cái thành từ hoặc cụm từ tiếng Việt có nghĩa.
+Ghép các chữ cái được cung cấp thành từ hoặc cụm từ tiếng Việt có nghĩa.
 
 QUY TẮC:
 - Sử dụng đúng các chữ cái được cung cấp.
 - Không tự ý thêm chữ cái.
 - Không tự ý bỏ chữ cái.
 - Giữ đúng dấu tiếng Việt.
-- Chú ý số lượng ký tự được đề cập trong câu đố.
+- Chú ý số lượng ký tự.
 - Ưu tiên đáp án phù hợp với ngữ cảnh.
 - Nếu có nhiều khả năng, chọn đáp án hợp lý nhất.
 - Chỉ trả về đáp án.
 - Không giải thích.
-- Không viết thêm lời dẫn.
+- Không viết lời dẫn.
 
 CÂU ĐỐ:
 {question}
@@ -149,7 +151,8 @@ CÂU ĐỐ:
             ],
 
             temperature=0.1,
-            max_completion_tokens=512
+            max_completion_tokens=2048,
+            reasoning_effort="low"
         )
 
         choice = response.choices[0]
@@ -159,18 +162,15 @@ CÂU ĐỐ:
         if not answer.strip():
 
             logging.error(
-                "AI không trả về nội dung. "
+                f"AI trả về rỗng. "
                 f"Finish reason: {choice.finish_reason}"
             )
 
             return None
 
         answer = answer.strip()
-
-        # Xóa dấu ngoặc code nếu AI tự thêm
         answer = answer.replace("`", "")
 
-        # Xóa phần mở đầu không cần thiết
         answer = re.sub(
             r"^(đáp án|answer)\s*[:：-]?\s*",
             "",
@@ -178,10 +178,7 @@ CÂU ĐỐ:
             flags=re.IGNORECASE
         )
 
-        # Chỉ lấy dòng đầu tiên
         answer = answer.splitlines()[0].strip()
-
-        # Loại bỏ dấu ngoặc kép ở hai đầu
         answer = answer.strip("\"'“”‘’")
 
         if not answer:
@@ -193,13 +190,13 @@ CÂU ĐỐ:
 
     except Exception:
 
-        logging.exception("Lỗi khi gọi Groq!")
+        logging.exception("Lỗi Groq API!")
 
         return None
 
 
 # =====================================================
-# XỬ LÝ TIN NHẮN
+# PROCESS MESSAGE
 # =====================================================
 
 async def process_message(message):
@@ -212,29 +209,29 @@ async def process_message(message):
     if message_id in processing:
         return
 
-    # Chỉ nhận tin nhắn từ Bot A
+    # Chỉ nhận Bot A
     if message.author.id != BOT_A_ID:
         return
 
-    # Chỉ theo dõi kênh đã cài đặt
+    # Chỉ nhận kênh chỉ định
     if message.channel.id != CHANNEL_ID:
         return
 
-    # Chỉ xử lý tin nhắn có Embed
+    # Chỉ nhận Embed
     if not message.embeds:
         return
 
     question = extract_embed(message)
 
     if not question:
-        logging.warning("Embed không có nội dung văn bản.")
+        logging.warning("Embed không có nội dung.")
         return
 
     processing.add(message_id)
 
     try:
 
-        logging.info("=" * 40)
+        logging.info("=" * 45)
         logging.info("NHẬN ĐƯỢC CÂU ĐỐ:")
         logging.info(question)
 
@@ -244,30 +241,29 @@ async def process_message(message):
             logging.warning("Không tìm được đáp án.")
             return
 
-        # Trả lời tin nhắn gốc
         await message.reply(
             content=f"`{answer}`",
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none()
         )
 
-        logging.info(f"Đã gửi đáp án: {answer}")
+        logging.info(f"ĐÃ TRẢ LỜI: {answer}")
 
         processed.add(message_id)
 
     except discord.Forbidden:
 
         logging.error(
-            "Bot không có quyền gửi tin nhắn trong kênh!"
+            "Bot thiếu quyền đọc hoặc gửi tin nhắn!"
         )
 
     except discord.HTTPException as e:
 
-        logging.error(f"Lỗi Discord: {e}")
+        logging.error(f"Lỗi Discord HTTP: {e}")
 
     except Exception:
 
-        logging.exception("Lỗi khi xử lý câu đố!")
+        logging.exception("Lỗi xử lý tin nhắn!")
 
     finally:
 
@@ -275,7 +271,7 @@ async def process_message(message):
 
 
 # =====================================================
-# NHẬN TIN NHẮN MỚI
+# NEW MESSAGE
 # =====================================================
 
 @bot.event
@@ -287,7 +283,7 @@ async def on_message(message):
 
 
 # =====================================================
-# XỬ LÝ KHI EMBED ĐƯỢC CHỈNH SỬA
+# EDIT MESSAGE
 # =====================================================
 
 @bot.event
@@ -295,29 +291,28 @@ async def on_message_edit(before, after):
 
     if before.embeds != after.embeds:
 
-        # Cho phép xử lý lại tin nhắn đã chỉnh sửa
         processed.discard(after.id)
 
         await process_message(after)
 
 
 # =====================================================
-# BOT KHỞI ĐỘNG
+# BOT READY
 # =====================================================
 
 @bot.event
 async def on_ready():
 
     logging.info("=" * 45)
-    logging.info(f"Bot đã online: {bot.user}")
-    logging.info(f"Bot A ID: {BOT_A_ID}")
-    logging.info(f"Kênh theo dõi: {CHANNEL_ID}")
-    logging.info(f"AI Model: {MODEL}")
+    logging.info(f"BOT ONLINE: {bot.user}")
+    logging.info(f"BOT A ID: {BOT_A_ID}")
+    logging.info(f"CHANNEL ID: {CHANNEL_ID}")
+    logging.info(f"AI MODEL: {MODEL}")
     logging.info("=" * 45)
 
 
 # =====================================================
-# CHẠY BOT
+# START BOT
 # =====================================================
 
 bot.run(DISCORD_TOKEN)
