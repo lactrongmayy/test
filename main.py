@@ -2,31 +2,25 @@ import os
 import re
 import asyncio
 import logging
-import time
-import random
 
 import discord
 from discord.ext import commands
-from google import genai
+from groq import AsyncGroq
 
 
 # ==========================================
 # CONFIG
 # ==========================================
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 BOT_A_ID = 1248205177589334026
 CHANNEL_ID = 1564912638272602142
 
-MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite"
-]
+MODEL = "openai/gpt-oss-20b"
 
-MAX_RETRIES = 3
+MAX_ANSWER_LENGTH = 200
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,22 +29,29 @@ logging.basicConfig(
 
 
 # ==========================================
-# GEMINI CLIENT
+# CHECK CONFIG
 # ==========================================
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("Thiếu GEMINI_API_KEY")
-
-if not TOKEN:
+if not DISCORD_TOKEN:
     raise RuntimeError("Thiếu DISCORD_TOKEN")
 
-ai = genai.Client(
-    api_key=GEMINI_API_KEY
+if not GROQ_API_KEY:
+    raise RuntimeError("Thiếu GROQ_API_KEY")
+
+
+# ==========================================
+# GROQ CLIENT
+# ==========================================
+
+ai = AsyncGroq(
+    api_key=GROQ_API_KEY,
+    max_retries=3,
+    timeout=30
 )
 
 
 # ==========================================
-# DISCORD
+# DISCORD CLIENT
 # ==========================================
 
 intents = discord.Intents.default()
@@ -111,92 +112,85 @@ def extract_embed(message):
 # SOLVE QUESTION
 # ==========================================
 
-def solve_question(question):
+async def solve_question(question):
 
     prompt = f"""
 Bạn là chuyên gia giải trò chơi ghép chữ tiếng Việt.
 
 NHIỆM VỤ:
 
-1. Đọc các chữ cái trong câu đố.
-2. Ghép chúng thành từ hoặc cụm từ tiếng Việt có nghĩa.
-3. Phải sử dụng đúng các chữ cái được cung cấp.
-4. Chú ý dấu thanh và dấu tiếng Việt.
-5. Không tự ý thêm hoặc bỏ chữ cái.
-6. Phân tích ngữ cảnh để tìm đáp án phù hợp nhất.
-7. Nếu có nhiều đáp án, chọn đáp án phù hợp nhất với câu hỏi.
+- Đọc các chữ cái bị xáo trộn.
+- Ghép thành từ hoặc cụm từ tiếng Việt có nghĩa.
+- Sử dụng đúng các chữ cái được cung cấp.
+- Chú ý dấu thanh và dấu tiếng Việt.
+- Không tự ý thêm hoặc bỏ chữ cái.
+- Phân tích ngữ cảnh để tìm đáp án.
+- Nếu có nhiều đáp án, chọn đáp án hợp lý nhất.
 
 CÂU ĐỐ:
 
 {question}
 
-YÊU CẦU TRẢ LỜI:
+QUY TẮC TRẢ LỜI:
 
 - Chỉ trả về đáp án.
 - Không giải thích.
+- Không viết lời dẫn.
 - Không đánh số.
-- Không viết "Đáp án là".
 - Không sử dụng Markdown.
-- Không thêm bất kỳ nội dung nào khác.
+- Không thêm nội dung khác.
 """
 
-    for model in MODELS:
+    response = await ai.chat.completions.create(
 
-        logging.info(f"Đang sử dụng model: {model}")
+        model=MODEL,
 
-        for attempt in range(MAX_RETRIES):
-
-            try:
-
-                response = ai.models.generate_content(
-                    model=model,
-                    contents=prompt
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là AI chuyên giải trò chơi ghép chữ "
+                    "tiếng Việt. Luôn trả lời ngắn gọn."
                 )
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
 
-                answer = (response.text or "").strip()
+        temperature=0.1,
 
-                answer = answer.replace("```", "")
-                answer = answer.replace("`", "")
+        max_completion_tokens=100
+    )
 
-                answer = re.sub(
-                    r"^(đáp án|answer)\s*[:：-]?\s*",
-                    "",
-                    answer,
-                    flags=re.IGNORECASE
-                )
+    answer = response.choices[0].message.content
 
-                answer = answer.splitlines()[0].strip()
+    if not answer:
+        return None
 
-                if not answer:
-                    raise ValueError("AI trả về đáp án rỗng")
+    answer = answer.strip()
 
-                logging.info(
-                    f"Đáp án từ {model}: {answer}"
-                )
+    answer = answer.replace("```", "")
+    answer = answer.replace("`", "")
 
-                return answer
+    answer = re.sub(
+        r"^(đáp án|answer)\s*[:：-]?\s*",
+        "",
+        answer,
+        flags=re.IGNORECASE
+    )
 
-            except Exception as error:
+    answer = answer.splitlines()[0].strip()
 
-                logging.error(
-                    f"{model} | Lần {attempt + 1}: {error}"
-                )
+    if not answer:
+        return None
 
-                if attempt < MAX_RETRIES - 1:
-
-                    wait = (2 ** (attempt + 1)) + random.uniform(0, 1)
-
-                    time.sleep(wait)
-
-        logging.warning(
-            f"Model {model} không khả dụng. Chuyển model tiếp theo."
-        )
-
-    return None
+    return answer
 
 
 # ==========================================
-# PROCESS MESSAGE
+# PROCESS EMBED
 # ==========================================
 
 async def process_message(message):
@@ -223,32 +217,29 @@ async def process_message(message):
         question = extract_embed(message)
 
         if not question:
+            logging.warning("Embed không có nội dung.")
             return
 
         logging.info("=" * 40)
-        logging.info("ĐÃ NHẬN EMBED")
+        logging.info("NHẬN ĐƯỢC CÂU ĐỐ:")
         logging.info(question)
 
-        # Gọi AI không chặn Discord
-        answer = await asyncio.to_thread(
-            solve_question,
-            question
-        )
+        logging.info("Đang gửi câu hỏi đến Groq...")
+
+        answer = await solve_question(question)
 
         if not answer:
 
-            logging.error(
-                "Tất cả model đều không trả lời được."
-            )
+            logging.warning("AI không trả về đáp án.")
 
             return
 
-        answer = answer[:200]
+        answer = answer[:MAX_ANSWER_LENGTH]
 
-        # Kiểm tra tin nhắn vẫn tồn tại
+        # Kiểm tra tin nhắn còn tồn tại
         await message.channel.fetch_message(message.id)
 
-        # Reply đáp án
+        # Trả lời trực tiếp Embed
         await message.reply(
             content=f"`{answer}`",
             mention_author=False,
@@ -257,24 +248,19 @@ async def process_message(message):
 
         processed.add(message.id)
 
-        # Giới hạn bộ nhớ cache
         if len(processed) > MAX_CACHE:
             processed.clear()
 
-        logging.info(
-            f"ĐÃ TRẢ LỜI: {answer}"
-        )
+        logging.info(f"ĐÃ TRẢ LỜI: {answer}")
 
     except discord.NotFound:
 
-        logging.warning(
-            "Embed đã bị xóa."
-        )
+        logging.warning("Embed đã bị xóa.")
 
     except Exception as error:
 
         logging.exception(
-            f"Lỗi xử lý Embed: {error}"
+            f"LỖI XỬ LÝ: {error}"
         )
 
     finally:
@@ -295,7 +281,7 @@ async def on_message(message):
 
 
 # ==========================================
-# EDITED MESSAGE
+# EDIT MESSAGE
 # ==========================================
 
 @bot.event
@@ -303,41 +289,42 @@ async def on_message_edit(before, after):
 
     if before.embeds != after.embeds:
 
-        processed.discard(after.id)
+        if after.id not in processed:
 
-        await process_message(after)
+            await process_message(after)
 
 
 # ==========================================
-# READY
+# BOT READY
 # ==========================================
 
 @bot.event
 async def on_ready():
 
-    logging.info("=" * 40)
+    logging.info("=" * 45)
 
-    logging.info(
-        f"BOT ONLINE: {bot.user}"
-    )
+    logging.info(f"BOT ONLINE: {bot.user}")
 
-    logging.info(
-        f"BOT A ID: {BOT_A_ID}"
-    )
+    logging.info(f"BOT A ID: {BOT_A_ID}")
 
-    logging.info(
-        f"CHANNEL ID: {CHANNEL_ID}"
-    )
+    logging.info(f"CHANNEL ID: {CHANNEL_ID}")
 
-    logging.info(
-        "Đang chờ Embed câu đố..."
-    )
+    logging.info(f"AI MODEL: {MODEL}")
 
-    logging.info("=" * 40)
+    logging.info("ĐANG CHỜ CÂU ĐỐ...")
+
+    logging.info("=" * 45)
 
 
 # ==========================================
 # START
 # ==========================================
 
-bot.run(TOKEN)
+async def main():
+
+    async with bot:
+
+        await bot.start(DISCORD_TOKEN)
+
+
+asyncio.run(main())
