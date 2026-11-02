@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import unicodedata
+import aiohttp
 from collections import Counter, OrderedDict
 
 import discord
@@ -15,8 +16,12 @@ from groq import AsyncGroq
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Tùy chọn: đường dẫn file từ điển tiếng Việt (mỗi dòng một từ/cụm từ)
-WORDLIST_PATH = os.getenv("WORDLIST_PATH")
+# File từ điển (tự tải về nếu chưa có)
+WORDLIST_PATH = os.getenv("WORDLIST_PATH", "Viet74K.txt")
+WORDLIST_URLS = [
+    "https://vietnamese-wordlist.duyet.net/Viet74K.txt",
+    "https://raw.githubusercontent.com/duyet/vietnamese-wordlist/master/Viet74K.txt",
+]
 
 BOT_A_ID = 1248205177589334026
 CHANNEL_ID = 1564912638272602142
@@ -97,34 +102,70 @@ processing = set()                    # message_id đang xử lý
 
 
 # ==================================================
-# TỪ ĐIỂN (TÙY CHỌN)
+# TỪ ĐIỂN + CHỈ MỤC ANAGRAM
 # ==================================================
 
 def normalize_text(text):
     return " ".join(unicodedata.normalize("NFC", text).casefold().split())
 
 
-def load_wordlist(path):
-    if not path:
-        return None
-
-    try:
-        with open(path, encoding="utf-8") as file:
-            words = {
-                normalize_text(line)
-                for line in file
-                if line.strip()
-            }
-
-        logging.info(f"Loaded {len(words)} words from {path}")
-        return words or None
-
-    except OSError:
-        logging.exception("Cannot load wordlist.")
-        return None
+def letters_key(text):
+    chars = [
+        c for c in unicodedata.normalize("NFC", text).casefold()
+        if c.isalpha()
+    ]
+    return "".join(sorted(chars))
 
 
-WORDLIST = load_wordlist(WORDLIST_PATH)
+ANAGRAMS = {}  # key chữ cái đã sắp xếp -> danh sách đáp án
+
+
+def build_index(lines):
+    ANAGRAMS.clear()
+    seen = set()
+
+    for line in lines:
+        word = normalize_text(line)
+
+        if not word or word in seen:
+            continue
+
+        if not all(c.isalpha() or c in " -" for c in word):
+            continue
+
+        seen.add(word)
+        ANAGRAMS.setdefault(letters_key(word), []).append(word)
+
+    logging.info(f"Indexed {len(seen)} words.")
+
+
+async def load_wordlist():
+    if os.path.exists(WORDLIST_PATH):
+        with open(WORDLIST_PATH, encoding="utf-8") as file:
+            build_index(file.read().splitlines())
+        return
+
+    async with aiohttp.ClientSession() as session:
+        for url in WORDLIST_URLS:
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+
+                    text = await resp.text(encoding="utf-8")
+
+                with open(WORDLIST_PATH, "w", encoding="utf-8") as file:
+                    file.write(text)
+
+                build_index(text.splitlines())
+                return
+
+            except Exception:
+                logging.exception(f"Cannot download {url}")
+
+    logging.error("Wordlist unavailable, using AI only.")
 
 
 # ==================================================
@@ -191,7 +232,7 @@ def extract_scrambled_letters(question):
         return None
 
     for part in parts:
-        if len(part) != 1 or not part.isalpha():
+        if not part.isalpha():
             logging.warning(f"Invalid character: {part}")
             return None
 
@@ -218,13 +259,6 @@ def validate_answer(answer, original_letters):
         return False
 
     return Counter(answer_letters) == Counter(original_letters)
-
-
-def in_wordlist(answer):
-    if WORDLIST is None:
-        return True
-
-    return normalize_text(answer) in WORDLIST
 
 
 # ==================================================
@@ -275,15 +309,31 @@ async def ask_groq(prompt, temperature):
 # GIẢI CÂU ĐỐ
 # ==================================================
 
-async def solve_question(question):
-    original_letters = extract_scrambled_letters(question)
+async def pick_candidate(question, candidates):
+    prompt = f"""
+Câu đố:
+{question}
 
-    if not original_letters:
-        return None
+Các đáp án khả dĩ:
+{chr(10).join("- " + c for c in candidates)}
 
+Chọn đúng MỘT đáp án phù hợp ngữ cảnh nhất.
+Chỉ trả về đáp án đó, không giải thích.
+"""
+    try:
+        picked = await ask_groq(prompt, 0.1)
+    except Exception:
+        logging.exception("Groq API error (pick).")
+        return candidates[0]
+
+    if picked and normalize_text(picked) in candidates:
+        return normalize_text(picked)
+
+    return candidates[0]
+
+
+async def solve_with_ai(question, original_letters):
     letters_text = " / ".join(original_letters)
-
-    logging.info(f"Letters: {letters_text}")
 
     prompt = f"""
 Bạn là chuyên gia giải trò chơi Vua Tiếng Việt.
@@ -307,13 +357,10 @@ YÊU CẦU:
 """
 
     rejected = []
-    fallback = None  # đúng chữ cái nhưng không có trong từ điển
 
     for attempt in range(MAX_ATTEMPTS):
         try:
-            logging.info(
-                f"Solving attempt {attempt + 1}/{MAX_ATTEMPTS}"
-            )
+            logging.info(f"AI attempt {attempt + 1}/{MAX_ATTEMPTS}")
 
             current_prompt = prompt
 
@@ -335,31 +382,39 @@ YÊU CẦU:
 
             logging.info(f"AI answer: {answer}")
 
-            if not validate_answer(answer, original_letters):
-                logging.warning("Answer rejected: wrong letters.")
-                rejected.append(answer)
-                continue
+            if validate_answer(answer, original_letters):
+                return answer
 
-            if not in_wordlist(answer):
-                logging.warning("Answer not in wordlist.")
-                rejected.append(answer)
-
-                if fallback is None:
-                    fallback = answer
-
-                continue
-
-            logging.info("Answer passed validation.")
-            return answer
+            logging.warning("Answer rejected: wrong letters.")
+            rejected.append(answer)
 
         except Exception:
             logging.exception("Groq API error.")
 
-    if fallback:
-        logging.info(f"Using fallback answer: {fallback}")
-        return fallback
-
     return None
+
+
+async def solve_question(question):
+    original_letters = extract_scrambled_letters(question)
+
+    if not original_letters:
+        return None
+
+    letters_text = " / ".join(original_letters)
+    logging.info(f"Letters: {letters_text}")
+
+    # Bước 1: tra từ điển theo anagram (chính xác 100% về chữ cái)
+    candidates = ANAGRAMS.get(letters_key("".join(original_letters)), [])
+    logging.info(f"Dictionary candidates: {candidates}")
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(candidates) > 1:
+        return await pick_candidate(question, candidates)
+
+    # Bước 2: không có trong từ điển -> nhờ AI
+    return await solve_with_ai(question, original_letters)
 
 
 # ==================================================
@@ -465,6 +520,11 @@ async def on_raw_message_edit(payload):
 
 
 @bot.event
+async def setup_hook():
+    await load_wordlist()
+
+
+@bot.event
 async def on_ready():
     logging.info("=" * 45)
     logging.info(f"BOT ONLINE: {bot.user}")
@@ -472,9 +532,7 @@ async def on_ready():
     logging.info(f"CHANNEL ID: {CHANNEL_ID}")
     logging.info(f"MODEL: {MODEL}")
     logging.info("LETTER VALIDATION: ENABLED")
-    logging.info(
-        f"WORDLIST: {'ENABLED' if WORDLIST else 'DISABLED'}"
-    )
+    logging.info(f"DICTIONARY ENTRIES: {len(ANAGRAMS)} anagram groups")
     logging.info("=" * 45)
 
 
