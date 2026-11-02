@@ -1,26 +1,43 @@
 import os
 import re
-import asyncio
 import logging
-
 import discord
+
 from discord.ext import commands
 from groq import AsyncGroq
 
 
-# ==========================================
-# CONFIG
-# ==========================================
+# =====================================================
+# CẤU HÌNH
+# =====================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# ID bot gửi câu đố
 BOT_A_ID = 1248205177589334026
+
+# ID kênh cần theo dõi
 CHANNEL_ID = 1564912638272602142
 
-MODEL = "openai/gpt-oss-20b"
+# Model Groq
+MODEL = "llama-3.3-70b-versatile"
 
-MAX_ANSWER_LENGTH = 200
+
+# =====================================================
+# KIỂM TRA CẤU HÌNH
+# =====================================================
+
+if not DISCORD_TOKEN:
+    raise ValueError("Thiếu DISCORD_TOKEN!")
+
+if not GROQ_API_KEY:
+    raise ValueError("Thiếu GROQ_API_KEY!")
+
+
+# =====================================================
+# LOG
+# =====================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,35 +45,13 @@ logging.basicConfig(
 )
 
 
-# ==========================================
-# CHECK CONFIG
-# ==========================================
-
-if not DISCORD_TOKEN:
-    raise RuntimeError("Thiếu DISCORD_TOKEN")
-
-if not GROQ_API_KEY:
-    raise RuntimeError("Thiếu GROQ_API_KEY")
-
-
-# ==========================================
-# GROQ CLIENT
-# ==========================================
-
-ai = AsyncGroq(
-    api_key=GROQ_API_KEY,
-    max_retries=3,
-    timeout=30
-)
-
-
-# ==========================================
-# DISCORD CLIENT
-# ==========================================
+# =====================================================
+# KHỞI TẠO
+# =====================================================
 
 intents = discord.Intents.default()
-
 intents.message_content = True
+intents.guilds = True
 intents.messages = True
 
 bot = commands.Bot(
@@ -64,213 +59,224 @@ bot = commands.Bot(
     intents=intents
 )
 
+ai = AsyncGroq(
+    api_key=GROQ_API_KEY,
+    max_retries=3,
+    timeout=30
+)
 
-# ==========================================
-# CACHE
-# ==========================================
-
+# Lưu ID tin nhắn đã xử lý
 processed = set()
+
+# Lưu ID tin nhắn đang xử lý
 processing = set()
 
-MAX_CACHE = 2000
 
-
-# ==========================================
-# EXTRACT EMBED
-# ==========================================
+# =====================================================
+# ĐỌC NỘI DUNG EMBED
+# =====================================================
 
 def extract_embed(message):
 
-    results = []
+    contents = []
 
     for embed in message.embeds:
 
         if embed.title:
-            results.append(embed.title)
+            contents.append(embed.title)
 
         if embed.description:
-            results.append(embed.description)
+            contents.append(embed.description)
 
         if embed.author and embed.author.name:
-            results.append(embed.author.name)
+            contents.append(embed.author.name)
 
-        for field in embed.fields:
+        if embed.fields:
+            for field in embed.fields:
 
-            if field.name:
-                results.append(field.name)
+                if field.name:
+                    contents.append(field.name)
 
-            if field.value:
-                results.append(field.value)
+                if field.value:
+                    contents.append(field.value)
 
         if embed.footer and embed.footer.text:
-            results.append(embed.footer.text)
+            contents.append(embed.footer.text)
 
-    return "\n".join(results).strip()
+    return "\n".join(contents).strip()
 
 
-# ==========================================
-# SOLVE QUESTION
-# ==========================================
+# =====================================================
+# GIẢI CÂU ĐỐ BẰNG GROQ
+# =====================================================
 
 async def solve_question(question):
 
     prompt = f"""
 Bạn là chuyên gia giải trò chơi ghép chữ tiếng Việt.
 
-NHIỆM VỤ:
+Nhiệm vụ:
+Đọc câu đố và ghép các chữ cái thành từ hoặc cụm từ tiếng Việt có nghĩa.
 
-- Đọc các chữ cái bị xáo trộn.
-- Ghép thành từ hoặc cụm từ tiếng Việt có nghĩa.
+QUY TẮC:
 - Sử dụng đúng các chữ cái được cung cấp.
-- Chú ý dấu thanh và dấu tiếng Việt.
-- Không tự ý thêm hoặc bỏ chữ cái.
-- Phân tích ngữ cảnh để tìm đáp án.
-- Nếu có nhiều đáp án, chọn đáp án hợp lý nhất.
-
-CÂU ĐỐ:
-
-{question}
-
-QUY TẮC TRẢ LỜI:
-
+- Không tự ý thêm chữ cái.
+- Không tự ý bỏ chữ cái.
+- Giữ đúng dấu tiếng Việt.
+- Chú ý số lượng ký tự được đề cập trong câu đố.
+- Ưu tiên đáp án phù hợp với ngữ cảnh.
+- Nếu có nhiều khả năng, chọn đáp án hợp lý nhất.
 - Chỉ trả về đáp án.
 - Không giải thích.
-- Không viết lời dẫn.
-- Không đánh số.
-- Không sử dụng Markdown.
-- Không thêm nội dung khác.
+- Không viết thêm lời dẫn.
+
+CÂU ĐỐ:
+{question}
 """
-
-    response = await ai.chat.completions.create(
-
-        model=MODEL,
-
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Bạn là AI chuyên giải trò chơi ghép chữ "
-                    "tiếng Việt. Luôn trả lời ngắn gọn."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-
-        temperature=0.1,
-
-        max_completion_tokens=100
-    )
-
-    answer = response.choices[0].message.content
-
-    if not answer:
-        return None
-
-    answer = answer.strip()
-
-    answer = answer.replace("```", "")
-    answer = answer.replace("`", "")
-
-    answer = re.sub(
-        r"^(đáp án|answer)\s*[:：-]?\s*",
-        "",
-        answer,
-        flags=re.IGNORECASE
-    )
-
-    answer = answer.splitlines()[0].strip()
-
-    if not answer:
-        return None
-
-    return answer
-
-
-# ==========================================
-# PROCESS EMBED
-# ==========================================
-
-async def process_message(message):
-
-    if message.author.id != BOT_A_ID:
-        return
-
-    if message.channel.id != CHANNEL_ID:
-        return
-
-    if not message.embeds:
-        return
-
-    if message.id in processed:
-        return
-
-    if message.id in processing:
-        return
-
-    processing.add(message.id)
 
     try:
 
-        question = extract_embed(message)
+        logging.info("Đang gửi câu hỏi đến Groq...")
 
-        if not question:
-            logging.warning("Embed không có nội dung.")
-            return
+        response = await ai.chat.completions.create(
+            model=MODEL,
+
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+
+            temperature=0.1,
+            max_completion_tokens=512
+        )
+
+        choice = response.choices[0]
+
+        answer = choice.message.content or ""
+
+        if not answer.strip():
+
+            logging.error(
+                "AI không trả về nội dung. "
+                f"Finish reason: {choice.finish_reason}"
+            )
+
+            return None
+
+        answer = answer.strip()
+
+        # Xóa dấu ngoặc code nếu AI tự thêm
+        answer = answer.replace("`", "")
+
+        # Xóa phần mở đầu không cần thiết
+        answer = re.sub(
+            r"^(đáp án|answer)\s*[:：-]?\s*",
+            "",
+            answer,
+            flags=re.IGNORECASE
+        )
+
+        # Chỉ lấy dòng đầu tiên
+        answer = answer.splitlines()[0].strip()
+
+        # Loại bỏ dấu ngoặc kép ở hai đầu
+        answer = answer.strip("\"'“”‘’")
+
+        if not answer:
+            return None
+
+        logging.info(f"Đáp án AI: {answer}")
+
+        return answer
+
+    except Exception:
+
+        logging.exception("Lỗi khi gọi Groq!")
+
+        return None
+
+
+# =====================================================
+# XỬ LÝ TIN NHẮN
+# =====================================================
+
+async def process_message(message):
+
+    message_id = message.id
+
+    if message_id in processed:
+        return
+
+    if message_id in processing:
+        return
+
+    # Chỉ nhận tin nhắn từ Bot A
+    if message.author.id != BOT_A_ID:
+        return
+
+    # Chỉ theo dõi kênh đã cài đặt
+    if message.channel.id != CHANNEL_ID:
+        return
+
+    # Chỉ xử lý tin nhắn có Embed
+    if not message.embeds:
+        return
+
+    question = extract_embed(message)
+
+    if not question:
+        logging.warning("Embed không có nội dung văn bản.")
+        return
+
+    processing.add(message_id)
+
+    try:
 
         logging.info("=" * 40)
         logging.info("NHẬN ĐƯỢC CÂU ĐỐ:")
         logging.info(question)
 
-        logging.info("Đang gửi câu hỏi đến Groq...")
-
         answer = await solve_question(question)
 
         if not answer:
-
-            logging.warning("AI không trả về đáp án.")
-
+            logging.warning("Không tìm được đáp án.")
             return
 
-        answer = answer[:MAX_ANSWER_LENGTH]
-
-        # Kiểm tra tin nhắn còn tồn tại
-        await message.channel.fetch_message(message.id)
-
-        # Trả lời trực tiếp Embed
+        # Trả lời tin nhắn gốc
         await message.reply(
             content=f"`{answer}`",
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none()
         )
 
-        processed.add(message.id)
+        logging.info(f"Đã gửi đáp án: {answer}")
 
-        if len(processed) > MAX_CACHE:
-            processed.clear()
+        processed.add(message_id)
 
-        logging.info(f"ĐÃ TRẢ LỜI: {answer}")
+    except discord.Forbidden:
 
-    except discord.NotFound:
-
-        logging.warning("Embed đã bị xóa.")
-
-    except Exception as error:
-
-        logging.exception(
-            f"LỖI XỬ LÝ: {error}"
+        logging.error(
+            "Bot không có quyền gửi tin nhắn trong kênh!"
         )
+
+    except discord.HTTPException as e:
+
+        logging.error(f"Lỗi Discord: {e}")
+
+    except Exception:
+
+        logging.exception("Lỗi khi xử lý câu đố!")
 
     finally:
 
-        processing.discard(message.id)
+        processing.discard(message_id)
 
 
-# ==========================================
-# NEW MESSAGE
-# ==========================================
+# =====================================================
+# NHẬN TIN NHẮN MỚI
+# =====================================================
 
 @bot.event
 async def on_message(message):
@@ -280,51 +286,38 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-# ==========================================
-# EDIT MESSAGE
-# ==========================================
+# =====================================================
+# XỬ LÝ KHI EMBED ĐƯỢC CHỈNH SỬA
+# =====================================================
 
 @bot.event
 async def on_message_edit(before, after):
 
     if before.embeds != after.embeds:
 
-        if after.id not in processed:
+        # Cho phép xử lý lại tin nhắn đã chỉnh sửa
+        processed.discard(after.id)
 
-            await process_message(after)
+        await process_message(after)
 
 
-# ==========================================
-# BOT READY
-# ==========================================
+# =====================================================
+# BOT KHỞI ĐỘNG
+# =====================================================
 
 @bot.event
 async def on_ready():
 
     logging.info("=" * 45)
-
-    logging.info(f"BOT ONLINE: {bot.user}")
-
-    logging.info(f"BOT A ID: {BOT_A_ID}")
-
-    logging.info(f"CHANNEL ID: {CHANNEL_ID}")
-
-    logging.info(f"AI MODEL: {MODEL}")
-
-    logging.info("ĐANG CHỜ CÂU ĐỐ...")
-
+    logging.info(f"Bot đã online: {bot.user}")
+    logging.info(f"Bot A ID: {BOT_A_ID}")
+    logging.info(f"Kênh theo dõi: {CHANNEL_ID}")
+    logging.info(f"AI Model: {MODEL}")
     logging.info("=" * 45)
 
 
-# ==========================================
-# START
-# ==========================================
+# =====================================================
+# CHẠY BOT
+# =====================================================
 
-async def main():
-
-    async with bot:
-
-        await bot.start(DISCORD_TOKEN)
-
-
-asyncio.run(main())
+bot.run(DISCORD_TOKEN)
