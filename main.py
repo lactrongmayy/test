@@ -81,18 +81,16 @@ ai = AsyncGroq(
 
 
 # ==================================================
-# QUẢN LÝ KÊNH (động + lưu file)
+# QUẢN LÝ KÊNH
 # ==================================================
 
 CHANNEL_IDS: Set[int] = set()
 
 
 def load_channels() -> None:
-    """Load kênh từ file + env (nếu có)."""
     global CHANNEL_IDS
     CHANNEL_IDS.clear()
 
-    # 1. Từ file
     if os.path.exists(CHANNELS_FILE):
         try:
             with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
@@ -102,7 +100,6 @@ def load_channels() -> None:
         except Exception as e:
             log.warning(f"Cannot load {CHANNELS_FILE}: {e}")
 
-    # 2. Từ env (thêm vào, không ghi đè)
     raw = os.getenv("CHANNEL_IDS") or os.getenv("CHANNEL_ID")
     if raw:
         for part in raw.split(","):
@@ -117,11 +114,10 @@ def load_channels() -> None:
 
 
 def save_channels() -> None:
-    """Lưu danh sách kênh ra file."""
     try:
         with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
             json.dump({"channels": sorted(CHANNEL_IDS)}, f, indent=2)
-        log.info(f"Saved {len(CHANNEL_IDS)} channels to {CHANNELS_FILE}")
+        log.info(f"Saved {len(CHANNEL_IDS)} channels → {CHANNELS_FILE}")
     except Exception as e:
         log.error(f"Cannot save channels: {e}")
 
@@ -326,14 +322,14 @@ def validate_answer(answer: str, original_letters: List[str]) -> bool:
 
 
 # ==================================================
-# GHÉP ÂM TIẾT
+# GHÉP ÂM TIẾT (ưu tiên 2 âm tiết)
 # ==================================================
 
 def solve_by_syllables(
     letters: List[str],
     max_parts: int = 7,
-    max_results: int = 40,
-    top: int = 12,
+    max_results: int = 50,
+    top: int = 15,
     timeout: float = 4.5,
 ) -> List[str]:
     deadline = time.monotonic() + timeout
@@ -348,7 +344,7 @@ def solve_by_syllables(
 
     fitting.sort(key=lambda x: -len(x[0]))
 
-    results: Dict[str, Tuple[int, int]] = {}
+    results: Dict[str, Tuple[int, int, int]] = {}  # phrase -> (num_parts, bigram, -len)
 
     def rec(chosen: List[str], remaining: Counter, used_len: int):
         if time.monotonic() > deadline or len(results) >= max_results:
@@ -356,10 +352,12 @@ def solve_by_syllables(
 
         if used_len == target_len:
             phrase = " ".join(chosen)
-            score = sum(
+            num_parts = len(chosen)
+            bigram_score = sum(
                 1 for a, b in zip(chosen, chosen[1:]) if (a, b) in BIGRAMS
             )
-            results[phrase] = (score, -len(chosen))
+            # Ưu tiên số âm tiết ít nhất (đặc biệt là 2)
+            results[phrase] = (num_parts, -bigram_score, -len(phrase))
             return
 
         if len(chosen) >= max_parts:
@@ -384,10 +382,10 @@ def solve_by_syllables(
 
     rec([], Counter(total), 0)
 
+    # Sắp xếp: số âm tiết tăng dần → bigram cao → ngắn hơn
     ranked = sorted(
         results.items(),
-        key=lambda x: (x[1][0], x[1][1]),
-        reverse=True,
+        key=lambda x: (x[1][0], x[1][1], x[1][2]),
     )
     return [phrase for phrase, _ in ranked[:top]]
 
@@ -466,6 +464,13 @@ async def pick_candidate(question: str, candidates: List[str]) -> str:
     if len(candidates) == 1:
         return candidates[0]
 
+    # Ưu tiên ứng viên 2 âm tiết trước khi hỏi AI
+    two_syllable = [c for c in candidates if len(c.split()) == 2]
+    if len(two_syllable) == 1:
+        return two_syllable[0]
+    if two_syllable:
+        candidates = two_syllable + [c for c in candidates if c not in two_syllable]
+
     prompt = f"""Câu đố:
 {question}
 
@@ -473,6 +478,7 @@ Các đáp án khả dĩ:
 {chr(10).join("- " + c for c in candidates)}
 
 Chọn đúng MỘT đáp án phù hợp ngữ cảnh nhất.
+Ưu tiên từ ghép đúng 2 âm tiết nếu có.
 Chỉ trả về đáp án đó, không giải thích."""
     picked = await ask_groq(prompt, 0.1)
     if picked:
@@ -496,7 +502,8 @@ CÂU ĐỐ:
 YÊU CẦU:
 - Ghép thành từ hoặc cụm từ tiếng Việt có nghĩa.
 - Sử dụng đúng toàn bộ chữ cái (kể cả dấu).
-- Các âm tiết viết cách nhau bằng dấu cách (ví dụ: lá lúa).
+- Các âm tiết viết cách nhau bằng dấu cách.
+- Ưu tiên mạnh đáp án là từ ghép chỉ có đúng 2 âm tiết nếu có thể.
 - Chỉ trả về đáp án duy nhất.
 - Không giải thích."""
 
@@ -572,8 +579,7 @@ async def solve_question(question: str) -> Optional[str]:
 # ==================================================
 
 async def safe_send(channel: discord.abc.Messageable, content: str) -> bool:
-    # Bọc đáp án bằng backtick theo yêu cầu
-    formatted = f"`{content}`"
+    formatted = f"`{content}`"  # bọc backtick
 
     for attempt in range(SEND_RETRIES):
         try:
@@ -655,7 +661,6 @@ async def process_message(message: discord.Message) -> None:
 # ==================================================
 
 def is_manager():
-    """Chỉ cho phép Manage Channels hoặc bot owner."""
     async def predicate(interaction: discord.Interaction) -> bool:
         if await bot.is_owner(interaction.user):
             return True
@@ -680,7 +685,7 @@ async def add_channel(
 
     if not isinstance(target, discord.TextChannel):
         await interaction.response.send_message(
-            "Chỉ hỗ trợ kênh văn bản (Text Channel).",
+            "Chỉ hỗ trợ kênh văn bản.",
             ephemeral=True,
         )
         return
@@ -784,7 +789,6 @@ async def setup_hook():
     load_channels()
     await load_wordlist()
 
-    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         log.info(f"Synced {len(synced)} slash command(s)")
