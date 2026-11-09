@@ -44,6 +44,17 @@ MAX_AI_TOKENS = 64
 SEND_RETRIES = 3
 AI_RETRIES = 2
 
+# ---- Tính năng thả emoji ----
+REACT_USER_IDS: Set[int] = {1293067282884464724, 1539164419395948606}
+REACT_EMOJIS = [
+    discord.PartialEmoji.from_str("<:gay_up:1566386923633905704>"),
+    "🇬",
+    "🇦",
+    "🇾",
+]
+REACT_DELAY = 0.4
+reaction_enabled = True  # /bat = True, /tat = False
+
 if not DISCORD_TOKEN:
     raise ValueError("Missing DISCORD_TOKEN")
 if not GROQ_API_KEY:
@@ -657,6 +668,22 @@ async def process_message(message: discord.Message) -> None:
 
 
 # ==================================================
+# THẢ EMOJI
+# ==================================================
+
+async def react_to_message(message: discord.Message) -> None:
+    """Thả lần lượt các emoji dưới tin nhắn (chạy nền, không chặn việc giải đố)."""
+    for emoji in REACT_EMOJIS:
+        try:
+            await message.add_reaction(emoji)
+        except discord.NotFound:
+            return  # tin nhắn đã bị xóa
+        except discord.HTTPException as e:
+            log.warning(f"Cannot react {emoji}: {e}")
+        await asyncio.sleep(REACT_DELAY)
+
+
+# ==================================================
 # SLASH COMMANDS
 # ==================================================
 
@@ -758,12 +785,57 @@ async def list_channels(interaction: discord.Interaction):
     )
 
 
+# ---- Lệnh bật/tắt thả emoji (chỉ admin thấy và dùng được) ----
+
+@bot.tree.command(name="bat", description="Bật chế độ thả emoji")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+async def bat(interaction: discord.Interaction):
+    global reaction_enabled
+    reaction_enabled = True
+    await interaction.response.send_message("✅ Đã bật chế độ thả emoji.", ephemeral=True)
+    log.info(f"Reaction ON by {interaction.user}")
+
+
+@bot.tree.command(name="tat", description="Tắt chế độ thả emoji")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+async def tat(interaction: discord.Interaction):
+    global reaction_enabled
+    reaction_enabled = False
+    await interaction.response.send_message("⛔ Đã tắt chế độ thả emoji.", ephemeral=True)
+    log.info(f"Reaction OFF by {interaction.user}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        # is_manager đã tự gửi thông báo; MissingPermissions thì gửi ở đây
+        if isinstance(error, app_commands.MissingPermissions) and not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Bạn không có quyền dùng lệnh này.",
+                ephemeral=True,
+            )
+        return
+    log.error(f"Command error: {error}")
+
+
 # ==================================================
 # EVENTS
 # ==================================================
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Thả emoji (chạy nền)
+    if (
+        reaction_enabled
+        and not message.author.bot
+        and message.author.id in REACT_USER_IDS
+    ):
+        asyncio.create_task(react_to_message(message))
+
     await process_message(message)
     await bot.process_commands(message)
 
@@ -804,6 +876,7 @@ async def on_ready():
     log.info(f"Channels    : {sorted(CHANNEL_IDS) or 'none (dùng /add)'}")
     log.info(f"Model       : {MODEL}")
     log.info(f"Anagram groups: {len(ANAGRAMS)}")
+    log.info(f"Reaction    : {'ON' if reaction_enabled else 'OFF'} ({len(REACT_USER_IDS)} users)")
     log.info("=" * 50)
 
 
