@@ -1,2 +1,3 @@
-discord.py
-groq
+discord.py>=2.3
+aiohttp>=3.9
+groq>=0.11
