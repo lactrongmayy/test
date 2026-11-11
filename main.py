@@ -12,8 +12,9 @@ if not TOKEN:
     print("Lỗi: Chưa đặt biến môi trường TOKEN")
     exit()
 
-DEFAULT_MESSAGE = """# NGU :)"""
-SO_LAN = 50  # số lần gửi mỗi lần gõ /chat
+DEFAULT_MESSAGE = "# NGU :)"
+SO_LAN = 50      # số tin gửi mỗi lần gõ /chat
+DELAY = 1.5      # giây giữa mỗi tin (tránh rate limit)
 # ==================================================
 
 COUNT_FILE = "chat_count.json"
@@ -56,15 +57,34 @@ async def on_ready():
 async def chat(interaction: discord.Interaction):
     global chat_count
 
-    # Tin đầu tiên
-    await interaction.response.send_message(DEFAULT_MESSAGE)
+    # Báo đã nhận lệnh (chỉ mình bạn thấy)
+    await interaction.response.defer(ephemeral=True)
 
-    # Các tin còn lại
-    for _ in range(SO_LAN - 1):
-        await asyncio.sleep(1)  # tránh rate limit
-        await interaction.followup.send(DEFAULT_MESSAGE)
+    channel = interaction.channel
+    sent = 0
 
-    chat_count += SO_LAN
+    # Thử gửi thẳng vào kênh
+    try:
+        if channel is None:
+            raise discord.Forbidden(None, "no channel")
+        for _ in range(SO_LAN):
+            await channel.send(DEFAULT_MESSAGE)
+            sent += 1
+            await asyncio.sleep(DELAY)
+        await interaction.delete_original_response()
+
+    # Không có quyền gửi vào kênh -> dùng followup (tối đa 5 tin)
+    except (discord.Forbidden, discord.HTTPException):
+        remaining = min(SO_LAN - sent, 5)
+        for _ in range(remaining):
+            try:
+                await interaction.followup.send(DEFAULT_MESSAGE)
+                sent += 1
+                await asyncio.sleep(DELAY)
+            except discord.HTTPException:
+                break
+
+    chat_count += sent
     save_count(chat_count)
 
 bot.run(TOKEN)
