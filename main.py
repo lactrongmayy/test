@@ -3,16 +3,17 @@ from discord import app_commands
 from discord.ext import commands
 import json
 import os
+import asyncio
 
 # ==================== CẤU HÌNH ====================
-TOKEN = os.getenv("TOKEN")   # Lấy token từ biến môi trường
+TOKEN = os.getenv("TOKEN")
 
 if not TOKEN:
     print("Lỗi: Chưa đặt biến môi trường TOKEN")
     exit()
 
-# Tin nhắn mặc định (sửa ở đây)
-DEFAULT_MESSAGE = """ # NGU :)"""
+DEFAULT_MESSAGE = """# NGU :)"""
+SO_LAN = 50  # số lần gửi mỗi lần gõ /chat
 # ==================================================
 
 COUNT_FILE = "chat_count.json"
@@ -54,10 +55,16 @@ async def on_ready():
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def chat(interaction: discord.Interaction):
     global chat_count
-    chat_count += 1
+
+    # Tin đầu tiên
+    await interaction.response.send_message(DEFAULT_MESSAGE)
+
+    # Các tin còn lại
+    for _ in range(SO_LAN - 1):
+        await asyncio.sleep(1)  # tránh rate limit
+        await interaction.followup.send(DEFAULT_MESSAGE)
+
+    chat_count += SO_LAN
     save_count(chat_count)
-    
-    message = DEFAULT_MESSAGE.format(count=50)
-    await interaction.response.send_message(message)
 
 bot.run(TOKEN)
