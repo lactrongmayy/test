@@ -81,9 +81,8 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
         can_send = channel is not None and interaction.app_permissions.send_messages
 
         if can_send:
-            # Bot có quyền: gửi thẳng vào kênh, xóa phản hồi
+            # Bot có quyền: gửi thẳng vào kênh, xóa phản hồi sau khi gửi xong
             await interaction.response.defer(ephemeral=True)
-            await interaction.delete_original_response()
             try:
                 for _ in range(so_lan):
                     await channel.send(noi_dung, allowed_mentions=MENTIONS)
@@ -91,6 +90,11 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
                     await asyncio.sleep(DELAY)
             except (discord.Forbidden, discord.HTTPException) as e:
                 print(f"Lỗi gửi tin: {e}")
+            finally:
+                try:
+                    await interaction.delete_original_response()
+                except discord.HTTPException:
+                    pass
         else:
             # Không có quyền: phản hồi công khai (tối đa 6 tin)
             await interaction.response.send_message(
@@ -114,7 +118,6 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
         print(f"Lỗi modal: {error}")
 
 
-# ==================== LỆNH ====================
 # ==================== LỆNH ====================
 @bot.event
 async def on_ready():
