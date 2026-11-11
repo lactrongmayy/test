@@ -76,40 +76,33 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
 
         noi_dung = self.noi_dung.value
         channel = interaction.channel
+
+        # Báo đã nhận (chỉ mình bạn thấy)
+        await interaction.response.defer(ephemeral=True)
+
         sent = 0
-
-        can_send = channel is not None and interaction.app_permissions.send_messages
-
-        if can_send:
-            # Bot có quyền: gửi thẳng vào kênh, xóa phản hồi sau khi gửi xong
-            await interaction.response.defer(ephemeral=True)
-            try:
-                for _ in range(so_lan):
-                    await channel.send(noi_dung, allowed_mentions=MENTIONS)
-                    sent += 1
-                    await asyncio.sleep(DELAY)
-            except (discord.Forbidden, discord.HTTPException) as e:
-                print(f"Lỗi gửi tin: {e}")
-            finally:
-                try:
-                    await interaction.delete_original_response()
-                except discord.HTTPException:
-                    pass
-        else:
-            # Không có quyền: phản hồi công khai (tối đa 6 tin)
-            await interaction.response.send_message(
-                noi_dung, allowed_mentions=MENTIONS, ephemeral=False
-            )
-            sent += 1
-            for _ in range(min(so_lan - 1, 5)):
+        try:
+            for _ in range(so_lan):
+                await channel.send(noi_dung, allowed_mentions=MENTIONS)
+                sent += 1
                 await asyncio.sleep(DELAY)
-                try:
-                    await interaction.followup.send(
-                        noi_dung, allowed_mentions=MENTIONS, ephemeral=False
-                    )
-                    sent += 1
-                except discord.HTTPException:
-                    break
+        except (discord.Forbidden, discord.HTTPException, AttributeError) as e:
+            print(f"Lỗi gửi tin: {e}")
+
+        if sent > 0:
+            # Xóa phản hồi để mất dòng "đã sử dụng /chat"
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
+        else:
+            # Không gửi được vào kênh -> báo lỗi riêng cho người dùng
+            await interaction.followup.send(
+                "Bot không gửi được vào kênh này. Hãy mời bot bằng **Guild Install** "
+                "và cấp quyền **View Channel + Send Messages** "
+                "(thêm **Mention @everyone, @here, and All Roles** nếu muốn ping role).",
+                ephemeral=True,
+            )
 
         chat_count += sent
         save_count(chat_count)
