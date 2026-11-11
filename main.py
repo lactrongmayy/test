@@ -12,8 +12,9 @@ if not TOKEN:
     print("Lỗi: Chưa đặt biến môi trường TOKEN")
     exit()
 
-MAX_LAN = 100    # số lần tối đa cho phép nhập
-DELAY = 1.5      # giây giữa mỗi tin (tránh rate limit)
+MAX_LAN = 5                # giới hạn của Discord mỗi lần: tối đa 5 followup
+DELAY = 1.5                # giây giữa mỗi tin
+TEXT_DANG_NHAP = "⌨️ Đang nhập..."
 # ==================================================
 
 COUNT_FILE = "chat_count.json"
@@ -44,81 +45,63 @@ bot = commands.Bot(
 )
 
 
-# ==================== BẢNG NHẬP ====================
-class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
-    noi_dung = discord.ui.TextInput(
-        label="Nội dung",
-        style=discord.TextStyle.paragraph,
-        placeholder="Nhập nội dung (tag dùng <@ID> hoặc <@&ID>)",
-        required=True,
-        max_length=2000,
-    )
-    so_lan = discord.ui.TextInput(
-        label=f"Số lần (1 - {MAX_LAN})",
-        placeholder="Ví dụ: 10",
-        default="1",
-        required=True,
-        max_length=3,
-    )
+# ==================== GỬI MỘT ĐỢT (tối đa 5 tin) ====================
+async def gui_dot(interaction: discord.Interaction, noi_dung: str, so_lan: int,
+                  xoa_phan_hoi: bool = False):
+    """Gửi so_lan tin bằng followup. Tin cuối có nút 'Gửi tiếp'."""
+    global chat_count
+    sent = 0
 
-    async def on_submit(self, interaction: discord.Interaction):
-        global chat_count
-
+    for i in range(so_lan):
+        await asyncio.sleep(DELAY)
+        la_tin_cuoi = (i == so_lan - 1)
         try:
-            so_lan = int(self.so_lan.value.strip())
-        except ValueError:
-            await interaction.response.send_message("Số lần phải là số nguyên.", ephemeral=True)
-            return
-        if not 1 <= so_lan <= MAX_LAN:
-            await interaction.response.send_message(f"Số lần phải từ 1 đến {MAX_LAN}.", ephemeral=True)
-            return
-
-        noi_dung = self.noi_dung.value
-        channel = interaction.channel
-
-        await interaction.response.defer(ephemeral=True)
-
-        sent = 0
-        first = None
-
-        try:
-            # Tin thứ nhất: gửi thẳng vào kênh
-            first = await channel.send(noi_dung, allowed_mentions=MENTIONS)
+            if la_tin_cuoi:
+                await interaction.followup.send(
+                    noi_dung,
+                    allowed_mentions=MENTIONS,
+                    view=TiepView(noi_dung, so_lan, interaction.user.id),
+                )
+            else:
+                await interaction.followup.send(noi_dung, allowed_mentions=MENTIONS)
             sent += 1
+        except discord.HTTPException as e:
+            print(f"Lỗi followup: {e}")
+            break
 
-            # Xóa phản hồi của lệnh (mất dòng "đã sử dụng /chat")
+        # Sau tin đầu tiên thì xóa "Đang nhập..."
+        if i == 0 and xoa_phan_hoi:
             try:
                 await interaction.delete_original_response()
             except discord.HTTPException:
                 pass
 
-            # Từ tin thứ 2: trả lời (reply) tin thứ nhất
-            for _ in range(so_lan - 1):
-                await asyncio.sleep(DELAY)
-                await channel.send(
-                    noi_dung,
-                    reference=first,
-                    allowed_mentions=MENTIONS,
-                )
-                sent += 1
-
-        except (discord.Forbidden, discord.HTTPException, AttributeError) as e:
-            print(f"Lỗi gửi tin: {e}")
-            if first is None:
-                await interaction.followup.send(
-                    "Bot không gửi được vào kênh này. Hãy mời bot bằng **Guild Install** "
-                    "và cấp quyền **View Channel + Send Messages**.",
-                    ephemeral=True,
-                )
-
-        chat_count += sent
-        save_count(chat_count)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        print(f"Lỗi modal: {error}")
+    chat_count += sent
+    save_count(chat_count)
 
 
-# ==================== LỆNH ====================
+# ==================== NÚT "GỬI TIẾP" ====================
+class TiepView(discord.ui.View):
+    def __init__(self, noi_dung: str, so_lan: int, user_id: int):
+        super().__init__(timeout=900)
+        self.noi_dung = noi_dung
+        self.so_lan = so_lan
+        self.user_id = user_id
+
+    @discord.ui.button(label="Gửi tiếp", style=discord.ButtonStyle.primary, emoji="➡️")
+    async def gui_tiep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Chỉ người dùng lệnh mới bấm được
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Chỉ người dùng lệnh mới bấm được.", ephemeral=True)
+            return
+
+        # Gỡ nút khỏi tin cũ (đây là phản hồi của lần bấm này)
+        await interaction.response.edit_message(view=None)
+
+        # Gửi thêm một đợt mới, tin cuối lại có nút "Gửi tiếp"
+        await gui_dot(interaction, self.noi_dung, self.so_lan)
+
+
 @bot.event
 async def on_ready():
     print(f"Bot đã online: {bot.user}")
@@ -128,10 +111,19 @@ async def on_ready():
     except Exception as e:
         print(f"Lỗi đồng bộ lệnh: {e}")
 
-@bot.tree.command(name="chat", description="Mở bảng nhập nội dung và số lần")
+
+# ==================== LỆNH /chat [nội dung] [số lần] ====================
+@bot.tree.command(name="chat", description="Gửi tin nhắn nhiều lần")
+@app_commands.describe(noi_dung="Nội dung cần gửi", so_lan=f"Số lần mỗi đợt (1 - {MAX_LAN})")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def chat(interaction: discord.Interaction):
-    await interaction.response.send_modal(ChatModal())
+async def chat(
+    interaction: discord.Interaction,
+    noi_dung: app_commands.Range[str, 1, 2000],
+    so_lan: app_commands.Range[int, 1, MAX_LAN] = MAX_LAN,
+):
+    await interaction.response.send_message(TEXT_DANG_NHAP)
+    await gui_dot(interaction, noi_dung, so_lan, xoa_phan_hoi=True)
+
 
 bot.run(TOKEN)
