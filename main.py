@@ -12,7 +12,7 @@ if not TOKEN:
     print("Lỗi: Chưa đặt biến môi trường TOKEN")
     exit()
 
-DEFAULT_MESSAGE = "# NGU :)"
+DEFAULT_MESSAGE = "# NGU :) <@&1570058118870728755>"
 SO_LAN = 50      # số tin gửi mỗi lần gõ /chat
 DELAY = 1.5      # giây giữa mỗi tin (tránh rate limit)
 # ==================================================
