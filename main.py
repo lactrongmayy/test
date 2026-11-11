@@ -120,4 +120,14 @@ async def on_ready():
     print(f"Bot đã online: {bot.user}")
     try:
         synced = await bot.tree.sync()
-        print(f"Đã đồng bộ {len(synced)} l
+        print(f"Đã đồng bộ {len(synced)} lệnh slash")
+    except Exception as e:
+        print(f"Lỗi đồng bộ lệnh: {e}")
+
+@bot.tree.command(name="chat", description="Mở bảng nhập nội dung và số lần")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def chat(interaction: discord.Interaction):
+    await interaction.response.send_modal(ChatModal())
+
+bot.run(TOKEN)
