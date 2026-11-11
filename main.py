@@ -13,7 +13,7 @@ if not TOKEN:
     exit()
 
 MAX_LAN = 5                # giới hạn của Discord mỗi lần: tối đa 5 followup
-DELAY = 1.5                # giây giữa mỗi tin
+DELAY = 0.1                # giây giữa mỗi tin
 TEXT_DANG_NHAP = "⌨️ Đang nhập..."
 # ==================================================
 
