@@ -115,6 +115,7 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
 
 
 # ==================== LỆNH ====================
+# ==================== LỆNH ====================
 @bot.event
 async def on_ready():
     print(f"Bot đã online: {bot.user}")
