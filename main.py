@@ -3,16 +3,16 @@ from discord import app_commands
 from discord.ext import commands
 import json
 import os
-import asyncio
 
 # ==================== CẤU HÌNH ====================
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("TOKEN")   # Lấy token từ biến môi trường
 
 if not TOKEN:
     print("Lỗi: Chưa đặt biến môi trường TOKEN")
     exit()
 
-DEFAULT_MESSAGE = """ # NGU:)"""
+# Tin nhắn mặc định (sửa ở đây)
+DEFAULT_MESSAGE = """ # NGU :)"""
 # ==================================================
 
 COUNT_FILE = "chat_count.json"
@@ -49,7 +49,7 @@ async def on_ready():
     except Exception as e:
         print(f"Lỗi đồng bộ lệnh: {e}")
 
-@bot.tree.command(name="chat", description="Gửi tin nhắn mặc định 100 lần")
+@bot.tree.command(name="chat", description="Gửi tin nhắn mặc định vào kênh")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def chat(interaction: discord.Interaction):
@@ -57,16 +57,7 @@ async def chat(interaction: discord.Interaction):
     chat_count += 1
     save_count(chat_count)
     
-    message = DEFAULT_MESSAGE.format(count=chat_count)
-    
-    await interaction.response.send_message("Đang gửi 100 tin nhắn...", ephemeral=True)
-    
-    for i in range(100):
-        try:
-            await interaction.channel.send(message)
-            await asyncio.sleep(1)  # Delay 1 giây mỗi tin để tránh rate limit
-        except Exception as e:
-            print(f"Lỗi gửi tin thứ {i+1}: {e}")
-            break
+    message = DEFAULT_MESSAGE.format(count=50)
+    await interaction.response.send_message(message)
 
 bot.run(TOKEN)
