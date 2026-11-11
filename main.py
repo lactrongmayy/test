@@ -12,12 +12,14 @@ if not TOKEN:
     print("Lỗi: Chưa đặt biến môi trường TOKEN")
     exit()
 
-DEFAULT_MESSAGE = "# NGU :) <@&1570058118870728755>"
+# Tag người: <@ID> | Tag role: <@&ID> | @everyone, @here viết thẳng
+DEFAULT_="# NGU :)<@&1570058118870728755>"
 SO_LAN = 50      # số tin gửi mỗi lần gõ /chat
 DELAY = 1.5      # giây giữa mỗi tin (tránh rate limit)
 # ==================================================
 
 COUNT_FILE = "chat_count.json"
+MENTIONS = discord.AllowedMentions.all()
 
 def load_count():
     if os.path.exists(COUNT_FILE):
@@ -38,6 +40,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
+    allowed_mentions=MENTIONS,
     allowed_installs=discord.app_commands.AppInstallationType(guild=True, user=True),
     allowed_contexts=discord.app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
 )
@@ -68,7 +71,7 @@ async def chat(interaction: discord.Interaction):
         if channel is None:
             raise discord.Forbidden(None, "no channel")
         for _ in range(SO_LAN):
-            await channel.send(DEFAULT_MESSAGE)
+            await channel.send(DEFAULT_MESSAGE, allowed_mentions=MENTIONS)
             sent += 1
             await asyncio.sleep(DELAY)
         await interaction.delete_original_response()
@@ -78,7 +81,7 @@ async def chat(interaction: discord.Interaction):
         remaining = min(SO_LAN - sent, 5)
         for _ in range(remaining):
             try:
-                await interaction.followup.send(DEFAULT_MESSAGE)
+                await interaction.followup.send(DEFAULT_MESSAGE, allowed_mentions=MENTIONS)
                 sent += 1
                 await asyncio.sleep(DELAY)
             except discord.HTTPException:
