@@ -64,7 +64,6 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
     async def on_submit(self, interaction: discord.Interaction):
         global chat_count
 
-        # Kiểm tra số lần
         try:
             so_lan = int(self.so_lan.value.strip())
         except ValueError:
@@ -77,32 +76,37 @@ class ChatModal(discord.ui.Modal, title="Gửi tin nhắn"):
         noi_dung = self.noi_dung.value
         channel = interaction.channel
 
-        # Báo đã nhận (chỉ mình bạn thấy)
-        await interaction.response.defer(ephemeral=True)
+        # 1. Bot phản hồi người dùng lệnh (công khai)
+        await interaction.response.send_message("⏳ Đang gửi...", ephemeral=False)
 
         sent = 0
-        try:
-            for _ in range(so_lan):
-                await channel.send(noi_dung, allowed_mentions=MENTIONS)
-                sent += 1
-                await asyncio.sleep(DELAY)
-        except (discord.Forbidden, discord.HTTPException, AttributeError) as e:
-            print(f"Lỗi gửi tin: {e}")
 
-        if sent > 0:
-            # Xóa phản hồi để mất dòng "đã sử dụng /chat"
+        # 2. Thử gửi thẳng vào kênh (không giới hạn số lượng)
+        if channel is not None:
             try:
-                await interaction.delete_original_response()
-            except discord.HTTPException:
-                pass
-        else:
-            # Không gửi được vào kênh -> báo lỗi riêng cho người dùng
-            await interaction.followup.send(
-                "Bot không gửi được vào kênh này. Hãy mời bot bằng **Guild Install** "
-                "và cấp quyền **View Channel + Send Messages** "
-                "(thêm **Mention @everyone, @here, and All Roles** nếu muốn ping role).",
-                ephemeral=True,
-            )
+                for _ in range(so_lan):
+                    await channel.send(noi_dung, allowed_mentions=MENTIONS)
+                    sent += 1
+                    await asyncio.sleep(DELAY)
+            except (discord.Forbidden, discord.HTTPException, AttributeError) as e:
+                print(f"Lỗi channel.send: {e}")
+
+        # 3. Không gửi được vào kênh -> dùng followup (tối đa 5 tin)
+        if sent == 0:
+            for _ in range(min(so_lan, 5)):
+                try:
+                    await interaction.followup.send(noi_dung, allowed_mentions=MENTIONS)
+                    sent += 1
+                    await asyncio.sleep(DELAY)
+                except discord.HTTPException as e:
+                    print(f"Lỗi followup: {e}")
+                    break
+
+        # 4. Xóa câu phản hồi "Đang gửi..." (mất luôn dòng "đã sử dụng /chat")
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
 
         chat_count += sent
         save_count(chat_count)
