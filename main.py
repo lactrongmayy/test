@@ -13,7 +13,7 @@ if not TOKEN:
     exit()
 
 # Tag người: <@ID> | Tag role: <@&ID> | @everyone, @here viết thẳng
-DEFAULT_="# NGU :)<@&1570058118870728755>"
+DEFAULT_="# <@&1570058118870728755>"
 SO_LAN = 50      # số tin gửi mỗi lần gõ /chat
 DELAY = 1.5      # giây giữa mỗi tin (tránh rate limit)
 # ==================================================
